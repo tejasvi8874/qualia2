@@ -12,7 +12,9 @@ export async function withRetry<T>(fn: () => Promise<T>, retries = 3, delay = 10
         }
     }
     throw lastError;
-}export class RateLimiter {
+}
+
+export class RateLimiter {
     private lastRequestTime: number = 0;
     private minInterval: number; // in milliseconds
 

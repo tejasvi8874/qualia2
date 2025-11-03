@@ -27,9 +27,11 @@ export interface Communication {
   toQualiaId: string;
   communicationType: CommunicationType;
   message: string;
+  // Instead of boolean, it is status enum
   ack: boolean;
+  processingBefore?: Timestamp;
   reasoning?: string;
-  fromQualiaId?: string;
+  fromQualiaId: string;
   isNewQualia?: boolean;
   money?: number;
   context?: string;
@@ -95,7 +97,8 @@ export interface Communications {
 export interface QualiaDoc {
   qualiaId: string;
   content: string[];
-  prevQualiaDocId: string;
+  nextQualiaDocId: string;
+  processingBefore?: Timestamp;
 }
 
 export interface CompactedQualia {
@@ -122,7 +125,7 @@ export interface Qualia {
 export interface ContextQualia {
   id: string;
   name: string;
-  // TODO: Sort contacts by lastContactTime descending on opening the sidebar
+  lastContactTime: Timestamp;
 }
 
 

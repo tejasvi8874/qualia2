@@ -3,6 +3,9 @@ import { getUserId, communicationsCollection, contactsCollection, getMessageList
 import { Communication, Contact, Contacts, ContextQualia, Qualia } from "./types";
 import { db } from "./firebaseAuth";
 import { withRetry } from "./requestUtils";
+import { updateContacts } from "./server";
+
+export { updateContacts };
 
 
 
@@ -26,7 +29,7 @@ export async function sendMessage({ message, contextQualia, toQualia }: { messag
 }
 
 export async function registerClientMessageClb(callback: (communication: Communication) => Promise<void>) {
-  return getMessageListener(await getUserId(), await communicationsCollection(), where("communicationType", "==", "QUALIA_TO_HUMAN"), callback);
+  return getMessageListener(await getUserId(), await communicationsCollection(), where("communicationType", "==", "QUALIA_TO_HUMAN"), callback, false);
 }
 
 export async function getContacts(): Promise<Contact[]> {
@@ -60,7 +63,7 @@ async function createQualia(qualiaId: string): Promise<Qualia> {
     transaction.set(qualiaDocRef, newQualia);
     return newQualia;
   });
-  return await withRetry(createQualiaTransaction);
+  return await createQualiaTransaction();
 }
 
 export async function getQualia(qualiaId: string): Promise<Qualia> {

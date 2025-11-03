@@ -9,11 +9,31 @@ import {
     getDoc,
     arrayUnion,
     runTransaction,
+    doc,
 } from "firebase/firestore";
-import { getGenerativeModel } from "firebase/ai";
+import { getGenerativeModel, HarmBlockThreshold, HarmCategory, ObjectSchema, GenerativeModel } from "firebase/ai";
 
 
 import { Communications, Communication, Contact, Contacts, QualiaDoc, Qualia, CompactedQualia } from "./types";
+
+async function generateContentNonStreaming(model: GenerativeModel, prompt: string) {
+    const result = await model.generateContentStream(prompt);
+    // Verify there is some content to stream
+
+    let text = "";
+    for await (const chunk of result.stream) {
+        try {
+            text += chunk.text();
+            if (text.length % 200 === 0) {
+                console.log(text)
+            }
+        } catch (error) {
+            console.error(error);
+            throw error;
+        }
+    }
+    return { response: { text: () => text } };
+}
 
 /*
 Runs in background, handles all communications. Designed to run on device or in cloud.
@@ -29,12 +49,14 @@ import { BASE_QUALIA } from "./constants";
 import { RateLimiter, withRetry } from "./requestUtils";
 
 export async function messageListener() {
-    return getMessageListener(await getUserId(), await communicationsCollection(), where("communicationType", "!=", "QUALIA_TO_HUMAN"), messageHandler);
+    return getMessageListener(await getUserId(), await communicationsCollection(), where("communicationType", "!=", "QUALIA_TO_HUMAN"), messageHandler, true);
 }
 
+const safetySettings = Object.values(HarmCategory).map((category) => ({ category, threshold: HarmBlockThreshold.BLOCK_NONE }));
 // pro, flash, flash-lite
-const communicationModel = getGenerativeModel(ai, { model: "gemini-2.5-pro", generationConfig: { responseMimeType: "application/json", responseSchema: COMMUNICATION_SCHEMA, thinkingConfig: {thinkingBudget: -1} } });
-const compactionModel = getGenerativeModel(ai, { model: "gemini-2.5-flash-lite", generationConfig: { responseMimeType: "application/json", responseSchema: QUALIA_SCHEMA, thinkingConfig: {thinkingBudget: -1} } });
+const proModel = (schema: ObjectSchema) => getGenerativeModel(ai, { model: "gemini-2.5-pro", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 32768 }, }, safetySettings }, {timeout: 1200 * 1e3});
+const communicationModel = proModel(COMMUNICATION_SCHEMA);
+const compactionModel = proModel(QUALIA_SCHEMA);
 
 const getResponseCommunicationsRateLimiter = new RateLimiter(60);
 
@@ -44,51 +66,104 @@ async function getResponseCommunications(qualiaDocContent: string[], qualia: Qua
     console.log("Rate limiter acquired");
     const prompt = `Generate new commmunications if required, keeping previous conversations in mind:\n${JSON.stringify({ myQualiaId: qualia.qualiaId, qualia: qualiaDocContent, money: qualia.money, communication: communication })}`;
     console.log(`Calling Gemini with prompt: ${prompt.substring(0, 100)}...`);
-    const result = await communicationModel.generateContent(prompt);
+    const result = await generateContentNonStreaming(communicationModel, prompt);
     const response = JSON.parse(result.response.text());
     console.log(`Received response from Gemini: ${JSON.stringify(response)}`);
     return response;
 }
 
-async function performCompaction(qualiaDocRef: DocumentReference): Promise<string> {
-    let newQualiaDocContent;
-    await runTransaction(db, async (transaction) => {
-        const qualiaDocSnapshot = await transaction.get(qualiaDocRef);
-        if (!qualiaDocSnapshot.exists()) {
+const MAX_COMPACTION_PROCESSING_SECONDS = 1200;
+const NETWORK_DELAY_SECONDS = 2;
+const COMPACTION_PROCESSING_SECONDS = 600;
+
+function getTimeToWait(processingBefore: number) {
+    const waitTime = processingBefore - Date.now() + NETWORK_DELAY_SECONDS * 1e3;
+    const isValidProcessingBefore = waitTime > 0 && waitTime < MAX_COMPACTION_PROCESSING_SECONDS * 1e3;
+    return isValidProcessingBefore ? waitTime : 0;
+}
+
+/*
+Keeps the same qualia doc id and just updates the content. Creates 
+*/
+async function performCompaction(qualiaDocRef: DocumentReference): Promise<DocumentReference> {
+    const qualiaDocSnapshot = await getDoc(qualiaDocRef);
+    if (!qualiaDocSnapshot.exists()) {
+        throw new Error("Qualia doc does not exist for compaction");
+    }
+    const oldQualia = qualiaDocSnapshot.data() as QualiaDoc;
+    if (oldQualia.nextQualiaDocId !== "") {
+        return doc(await qualiaDocsCollection(), oldQualia.nextQualiaDocId);
+    }
+    const prompt = `Initiate sleep:\n${JSON.stringify(oldQualia.content)}`;
+    console.log(`Calling Gemini with prompt: ${prompt.substring(0, 100)}...`);
+    console.log(prompt);
+    const result = await generateContentNonStreaming(compactionModel, prompt);
+    const parsed = JSON.parse(result.response.text()) as CompactedQualia;
+    const newQualiaDocContent = parsed.qualia;
+
+    const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), { content: [newQualiaDocContent], qualiaId: oldQualia.qualiaId, nextQualiaDocId: "" });
+    console.log(`New qualia doc created: ${newQualiaDocRef.id}`);
+    await updateDoc(qualiaDocRef, { nextQualiaDocId: newQualiaDocRef.id, processingBefore: null });
+    return newQualiaDocRef;
+}
+
+async function qualiaCompaction(qualiaDocRef: DocumentReference): Promise<DocumentReference> {
+    let nextDocRef: DocumentReference | undefined;
+    let processingBefore: Timestamp | undefined;
+    let timeToWait = 0;
+
+    const claimed = await runTransaction(db, async (transaction) => {
+        const docSnap = await transaction.get(qualiaDocRef);
+        if (!docSnap.exists()) {
             throw new Error("Qualia doc does not exist for compaction");
         }
-        const oldQualia = qualiaDocSnapshot.data() as QualiaDoc;
-        const prompt = `Compact the below qualia:\n${JSON.stringify(oldQualia.content)}`;
-        console.log(`Calling Gemini with prompt: ${prompt.substring(0, 100)}...`);
-        const result = await compactionModel.generateContent(prompt);
-        const parsed = JSON.parse(result.response.text()) as CompactedQualia;
-        newQualiaDocContent = parsed.qualia;
+        const data = docSnap.data() as QualiaDoc;
 
-        const archivedDocRef = await addDoc(await qualiaDocsCollection(), oldQualia);
-        console.log(`Archived old qualia doc to: ${archivedDocRef.id}`);
-        transaction.update(qualiaDocRef, {
-            content: [newQualiaDocContent],
-            prevQualiaDocId: archivedDocRef.id,
-        });
+        if (data.nextQualiaDocId) {
+            nextDocRef = doc(await qualiaDocsCollection(), data.nextQualiaDocId);
+            return false;
+        }
+
+        if (data.processingBefore) {
+            timeToWait = getTimeToWait(data.processingBefore.toMillis());
+            if (timeToWait > 0) {
+                processingBefore = data.processingBefore; // Capture the timestamp
+                return false;
+            }
+        }
+
+        transaction.update(qualiaDocRef, { processingBefore: Timestamp.fromMillis(Date.now() + COMPACTION_PROCESSING_SECONDS * 1e3) });
+        return true;
     });
-    if (!newQualiaDocContent) {
-        throw new Error("Could not get archived document reference ID.");
+
+    if (nextDocRef) {
+        return nextDocRef;
     }
-    return newQualiaDocContent;
+
+    if (claimed) {
+        console.log(`Claimed ${qualiaDocRef.id} for compaction.`);
+        try {
+            // withRetry is important for network errors during compaction
+            const newQualiaDocRef = await performCompaction(qualiaDocRef);
+            console.log(`Compaction complete. Existing doc ${qualiaDocRef.id} updated with new content.`);
+            return newQualiaDocRef;
+        } catch (error) {
+            console.error(`Error during qualia compaction: ${qualiaDocRef.id} : ${error}`);
+            throw error;
+        }
+    }
+
+    if (processingBefore) {
+        console.log(`Another client is compacting ${qualiaDocRef.id}, waiting for ${timeToWait}ms`);
+        return await new Promise(resolve => setTimeout(resolve, timeToWait)).then(() => qualiaCompaction(qualiaDocRef));
+    }
+
+    throw new Error(`Unable to claim ${qualiaDocRef.id} for compaction`);
 }
 
-async function qualiaCompaction(qualiaDocRef: DocumentReference): Promise<string> {
-    try {
-        const compactionLogic = () => performCompaction(qualiaDocRef);
-        const newQualiaDocContent = await withRetry(compactionLogic);
-        console.log(`Compaction complete. Existing doc ${qualiaDocRef.id} updated with new content.`);
-        return newQualiaDocContent;
-    } catch (error) {
-        console.error(`Error during qualia compaction: ${qualiaDocRef.id} : ${error}`);
-        throw error;
-    }
-}
-
+/*
+    Merges the new names with the existing ones.
+*/
 export async function updateContacts(contacts: Contact[]): Promise<void> {
     console.log(`Updating contacts: ${JSON.stringify(contacts)}`);
     const q = query(
@@ -144,14 +219,10 @@ async function messageHandler(communication: Communication): Promise<void> {
     read the message
     create new communications
     */
-    const qualiaDocRef = await getQualiaDoc(qualiaId);
-    const qualiaDocSnapshot = await getDoc(qualiaDocRef);
-    const qualiaDoc = qualiaDocSnapshot.data() as QualiaDoc;
-    const qualiaDocString = JSON.stringify(qualiaDoc);
-    if (qualiaDocString.length > 2 ** 20 / 4) {
-        await qualiaCompaction(qualiaDocRef);
-    }
-    console.log(`Retrieved qualia doc: ${qualiaDocString.substring(0, 100)}...`);
+    const qualiaDocRef = await getQualiaDocRef(qualiaId);
+    const qualiaDoc = (await getDoc(qualiaDocRef)).data() as QualiaDoc;
+    console.log(`Retrieved qualia doc: ${JSON.stringify(qualiaDoc).substring(0, 100)}...`);
+
     let relevantCommunication: Partial<Communication>;
     let contacts: Contact[] = [];
     if (communication.communicationType === "HUMAN_TO_QUALIA") {
@@ -216,6 +287,18 @@ async function messageHandler(communication: Communication): Promise<void> {
     }
     await updateContacts(contacts);
     console.log(`Message handling complete for communication: ${JSON.stringify(communication)}`);
+    console.log(`For the communication:\n${JSON.stringify(communication)}\n\nGenerated below communications:\n ${JSON.stringify(validCommunications)}`)
+}
+
+async function getQualiaDocRef(qualiaId: string) {
+    let qualiaDocRef = await getQualiaDoc(qualiaId);
+    const qualiaDoc = (await getDoc(qualiaDocRef)).data() as QualiaDoc;
+    const qualiaDocString = JSON.stringify(qualiaDoc);
+    console.log("Qualia doc size: ", qualiaDocString.length);
+    if (qualiaDocString.length > 2 ** 20) {
+        qualiaDocRef = await qualiaCompaction(qualiaDocRef);
+    }
+    return qualiaDocRef;
 }
 
 async function getValidCommunication(communication: Communication): Promise<Communication> {
@@ -304,18 +387,18 @@ async function getQualiaDoc(qualiaId: string): Promise<DocumentReference> {
     const q = query(
         await qualiaDocsCollection(),
         where("qualiaId", "==", qualiaId),
-        where("prevQualiaDocId", "==", "")
+        where("nextQualiaDocId", "==", "")
     );
     const snapshot = await getDocs(q);
     const docs = snapshot.docs;
     if (docs.length === 0) {
         // Create initial qualia doc
-        const initialQualiaDoc: QualiaDoc = { qualiaId: qualiaId, content: [BASE_QUALIA], prevQualiaDocId: "", };
+        const initialQualiaDoc: QualiaDoc = { qualiaId: qualiaId, content: [BASE_QUALIA], nextQualiaDocId: "", };
         console.log(`Creating initial qualia doc: ${JSON.stringify(initialQualiaDoc)}`);
         return await addDoc(await qualiaDocsCollection(), initialQualiaDoc);
     }
     if (docs.length > 1) {
-        console.error(`Unique qualia doc not found: ${docs}`);
+        console.error(`Unique qualia doc not found: ${JSON.stringify(docs)}`);
         throw new Error(`Unique qualia doc not found: ${docs}`);
     }
     console.log(`Retrieved qualia doc ref: ${docs[0].ref.path}`);
