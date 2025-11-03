@@ -35,3 +35,6 @@ yarn-error.*
 
 # typescript
 *.tsbuildinfo
+docs-devsite
+expo_docs
+.gitignore

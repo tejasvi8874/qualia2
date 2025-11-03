@@ -26,6 +26,9 @@ import { getUserId } from "./firebase";
 import { messageListener } from "./server";
 import { auth } from "./firebaseAuth";
 import { signInAnonymously, linkWithPhoneNumber, RecaptchaVerifier, signInWithPhoneNumber } from "firebase/auth";
+import { getLiveGenerativeModel, startAudioConversation, AudioConversationController, LiveSession, LiveGenerativeModel } from "firebase/ai";
+import { ai } from "./firebaseAuth";
+import * as FileSystem from "expo-file-system";
 
 declare global {
   interface Window {
@@ -343,6 +346,9 @@ const AppContent = () => {
   // State
   const [userQualia, setUserQualia] = useState<ContextQualia | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
+  const [isCalling, setIsCalling] = useState(false);
+  const [audioController, setAudioController] = useState<AudioConversationController | null>(null);
+  const liveSessionRef = useRef<LiveSession | null>(null);
 
   useEffect(() => {
     const unsubscribe = auth.onAuthStateChanged((user) => {
@@ -402,6 +408,114 @@ const AppContent = () => {
     auth.signOut();
     setIsSwitcherVisible(false);
   }, []);
+
+  async function stopRecording() {
+    if (!audioController) {
+      return;
+    }
+    await audioController.stop();
+    setAudioController(null);
+    if (liveSessionRef.current) {
+      liveSessionRef.current.close();
+      liveSessionRef.current = null;
+    }
+  }
+
+  const handleCall = async () => {
+    if (isCalling) {
+      console.log("Ending call.");
+      addMessage("(Call ended)", "ui");
+      await stopRecording();
+    } else {
+      console.log("Starting call.");
+      addMessage("(Call started)", "ui");
+      const model = getLiveGenerativeModel(ai, {
+        model: "gemini-2.0-flash-live-001", // Do not change
+        generationConfig: {
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: "Aoede"
+              }
+            }
+          },
+        }
+      });
+      const session = await model.connect();
+      liveSessionRef.current = session;
+      const controller = await startAudioConversation(session);
+      setAudioController(controller);
+      receiveMessages(session);
+    }
+    setIsCalling(!isCalling);
+  };
+
+  const receiveMessages = async (liveSession: LiveSession) => {
+    const messageStream = liveSession.receive();
+    const userTranscription: string[] = [];
+    const modelTranscription: string[] = [];
+
+    const flushUser = () => {
+      if (userTranscription.length > 0) {
+        addMessage(userTranscription.join(""), "user");
+        userTranscription.length = 0;
+      }
+    };
+    const flushModel = () => {
+      if (modelTranscription.length > 0) {
+        addMessage(modelTranscription.join(""), "gemini");
+        modelTranscription.length = 0;
+      }
+    };
+
+    try {
+      for await (const message of messageStream) {
+        if (message.type === 'serverContent') {
+          if (message.inputTranscription?.text) {
+            flushModel();
+            userTranscription.push(message.inputTranscription.text);
+          }
+          if (message.outputTranscription?.text) {
+            flushUser();
+            modelTranscription.push(message.outputTranscription.text);
+          }
+
+          if (message.turnComplete) {
+            flushUser();
+            flushModel();
+          }
+
+          if (message.modelTurn) {
+            for (const part of message.modelTurn.parts) {
+              if ("inlineData" in part && part.inlineData) {
+                if (message.outputTranscription?.text) console.log("Model output", message.outputTranscription?.text);
+              }
+            }
+          }
+
+          const logMessage = JSON.parse(JSON.stringify(message));
+          if (logMessage.modelTurn) {
+            for (const part of logMessage.modelTurn.parts) {
+              if ("inlineData" in part && part.inlineData) {
+                part.inlineData.data = part.inlineData.data.substring(0, 100);
+              }
+            }
+          }
+          console.log(JSON.stringify(logMessage));
+        }
+      }
+    } finally {
+      if (isCalling) {
+        console.log("Live session closed.");
+        addMessage("(Call ended)", "ui");
+        setIsCalling(false);
+        setAudioController(null);
+      }
+    }
+  };
 
   // Derived State for UI presentation
   const isTalkingToSelf = useMemo(() => {
@@ -713,6 +827,13 @@ const AppContent = () => {
               {activeQualia ? activeQualia.name : "Loading..."}
             </Text>
           </TouchableOpacity>
+          {userQualia && (
+            <TouchableOpacity onPress={handleCall}>
+              <Text style={[styles.headerTitle, { color: isCalling ? theme.createAccent : theme.text }]}>
+                {isCalling ? "End" : "Call"}
+              </Text>
+            </TouchableOpacity>
+          )}
         </View>
 
         {/* Chat Area */}
@@ -811,8 +932,9 @@ const styles = StyleSheet.create({
     paddingTop: 10,
     paddingBottom: 15,
     paddingHorizontal: 15,
-    alignItems: "flex-start",
-    justifyContent: "center",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
   },
   chatList: {
     flex: 1,
