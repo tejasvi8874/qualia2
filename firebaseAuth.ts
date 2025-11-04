@@ -19,18 +19,7 @@ import { Communications } from "./types";
 import { User, onAuthStateChanged } from "firebase/auth";
 import Constants from "expo-constants";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-
-const firebaseConfig = {
-    apiKey: "AIzaSyCtCRDHe44Q85z3Tq04NQKoNl5puxe3Nmg",
-    authDomain: "tstomar-experimental.firebaseapp.com",
-    databaseURL: "https://tstomar-experimental-default-rtdb.firebaseio.com",
-    projectId: "tstomar-experimental",
-    storageBucket: "tstomar-experimental.firebasestorage.app",
-    messagingSenderId: "311770829841",
-    appId: "1:311770829841:web:99a1ca05c0d01b55ce4db0",
-    measurementId: "G-HDL6LDBP9G",
-};
-
+import { firebaseConfig } from "./firebaseConfig";
 
 const app = initializeApp(firebaseConfig);
 initializeFirestore(app, {
@@ -64,8 +53,8 @@ async function signIn(): Promise<User> {
         console.log("recaptcha", response);
       }
     });
-    return signInWithPhoneNumber(auth, window.prompt("Enter phone number in format +COUNTRY_CODE_PHONE_NUMBER:")!, window.recaptchaVerifier)
-      .then((confirmationResult) => confirmationResult.confirm("123456").then((res) => {
+    return signInWithPhoneNumber(auth, window.prompt("Enter phone number in format +COUNTRY_CODE_PHONE_NUMBER E.g. +1234567890:")!, window.recaptchaVerifier)
+      .then((confirmationResult) => confirmationResult.confirm(window.prompt("Enter verification code:")!).then((res) => {
           console.log("res", res);
           return res.user;
       }))
