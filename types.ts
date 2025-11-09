@@ -22,6 +22,7 @@ export interface Contacts {
 }
 
 export interface Communication {
+  id?: string;
   fromQualiaName: string;
   toQualiaName: string;
   toQualiaId: string;

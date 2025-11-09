@@ -1,8 +1,7 @@
-import { addDoc, query, where, onSnapshot, updateDoc, getDocs, Timestamp, runTransaction, doc } from "firebase/firestore";
+import { addDoc, query, where, getDocs, Timestamp, runTransaction, doc, orderBy, limit } from "firebase/firestore";
 import { getUserId, communicationsCollection, contactsCollection, getMessageListener, qualiaCollection } from "./firebase";
 import { Communication, Contact, Contacts, ContextQualia, Qualia } from "./types";
 import { db } from "./firebaseAuth";
-import { withRetry } from "./requestUtils";
 import { updateContacts } from "./server";
 
 export { updateContacts };
@@ -48,6 +47,26 @@ export async function getContacts(): Promise<Contact[]> {
     }
     return contactList[0] || [];
   });
+}
+
+export async function getHistoricalMessages(oldestMessageTime: Timestamp, count: number): Promise<Communication[]> {
+  const userId = await getUserId();
+  const coll = await communicationsCollection();
+  const q = query(
+    coll,
+    where("toQualiaId", "==", userId),
+    where("communicationType", "==", "QUALIA_TO_HUMAN"),
+    orderBy("deliveryTime", "desc"),
+    where("deliveryTime", "<", oldestMessageTime),
+    limit(count)
+  );
+
+  const snapshot = await getDocs(q);
+  const messages: Communication[] = [];
+  snapshot.forEach((doc) => {
+    messages.push({ id: doc.id, ...doc.data() } as Communication);
+  });
+  return messages.reverse(); // Return in ascending time order
 }
 
 async function createQualia(qualiaId: string): Promise<Qualia> {

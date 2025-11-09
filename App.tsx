@@ -20,15 +20,12 @@ import {
 // Import SafeAreaProvider to use in the root and within the Modal
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
-import { sendMessage, registerClientMessageClb, getContacts, updateContacts } from "./firebaseClientUtils";
-import { Communications, Communication, ContextQualia } from "./types";
+import { sendMessage, registerClientMessageClb, getContacts, updateContacts, getHistoricalMessages } from "./firebaseClientUtils";
+import { Communication, ContextQualia } from "./types";
 import { Timestamp } from "firebase/firestore";
-import { getUserId } from "./firebase";
 import { messageListener } from "./server";
 import { auth } from "./firebaseAuth";
-import { signInAnonymously, linkWithPhoneNumber, RecaptchaVerifier, signInWithPhoneNumber } from "firebase/auth";
-import { ai } from "./firebaseAuth";
-import * as FileSystem from "expo-file-system";
+import { RecaptchaVerifier } from "firebase/auth";
 import { firebaseConfig } from "./firebaseConfig";
 import { startAudioSession } from "./audioSession";
 import { LiveSession } from "firebase/ai";
@@ -105,6 +102,8 @@ interface Message {
   isThought?: boolean;
   contextId?: string;
   contextName?: string;
+  deliveryTime?: Timestamp;
+  isInitialHistory?: boolean;
 }
 
 const getTheme = (colorScheme: LocalColorScheme): Theme => {
@@ -131,16 +130,21 @@ interface MessageItemProps {
     isThought?: boolean;
     contextId?: string;
     contextName?: string;
+    isInitialHistory?: boolean;
   };
   theme: Theme;
   isTalkingToSelf: boolean;
+  hasScrolled: boolean;
 }
 
 const MessageItem = React.memo(function MessageItem({
   item,
   theme,
   isTalkingToSelf,
+  hasScrolled,
 }: MessageItemProps) {
+  const isVisible = !item.isInitialHistory || hasScrolled;
+  const containerStyle = { opacity: isVisible ? 1 : 0 };
   // Hooks must be called unconditionally at the top level.
 
   // Handle potential undefined isThought property (e.g., for delimiters) safely.
@@ -162,7 +166,7 @@ const MessageItem = React.memo(function MessageItem({
   // Handle Delimiter
   if (item.type === "delimiter") {
     return (
-      <View style={styles.delimiterContainer}>
+      <View style={[styles.delimiterContainer, containerStyle]}>
         <View
           style={[styles.delimiterLine, { backgroundColor: theme.dimText }]}
         />
@@ -186,7 +190,7 @@ const MessageItem = React.memo(function MessageItem({
       : text;
 
   return (
-    <View style={styles.messageContainer}>
+    <View style={[styles.messageContainer, containerStyle]}>
       <Text style={textStyle}>{displayText}</Text>
     </View>
   );
@@ -408,6 +412,50 @@ const AppContent = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState("");
   const [isSwitcherVisible, setIsSwitcherVisible] = useState(false);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const [hasScrolled, setHasScrolled] = useState(false);
+
+  const fetchHistory = useCallback(async () => {
+    if (!activeQualia || isLoadingHistory) return;
+
+    if (!activeQualia?.name){
+      throw new Error("No active qualia"+ JSON.stringify(activeQualia));
+    }
+    console.log("Fetching history...");
+    setIsLoadingHistory(true);
+
+    const oldestMessage = messages[0];
+    const before = oldestMessage?.deliveryTime || Timestamp.now();
+
+    try {
+      const historicalMessages = await getHistoricalMessages(before, 10);
+      if (historicalMessages.length > 0) {
+        const newMessages = historicalMessages.map((msg) => ({
+          ...msg,
+          id: msg.id || `${msg.deliveryTime?.toMillis()}-${Math.random()}`,
+          text: msg.message,
+          isThought: msg.fromQualiaId !== activeQualia?.id,
+          contextId: activeQualia?.id,
+          contextName: activeQualia?.name,
+          isInitialHistory: isInitialLoad,
+        }));
+        setMessages((prev) => [...newMessages, ...prev]);
+      }
+    } catch (error) {
+      console.error("Error fetching historical messages:", error);
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  }, [messages, isLoadingHistory, activeQualia, isInitialLoad]);
+
+  useEffect(() => {
+    // Fetch initial message history when the active qualia is set
+    if (activeQualia && isInitialLoad) {
+      fetchHistory();
+      setIsInitialLoad(false);
+    }
+  }, [activeQualia, isInitialLoad, fetchHistory]);
 
   const handleSignOut = useCallback(() => {
     auth.signOut();
@@ -463,8 +511,7 @@ const AppContent = () => {
   const inputRef = useRef<TextInput>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSentIndexRef = useRef(0);
-  // Allow null in the ref type so we can safely check before calling instance methods
-  const flatListRef = useRef<FlatList<any> | null>(null);
+  const [flatListHeight, setFlatListHeight] = useState(0);
 
   useEffect(() => {
     console.log("Setting up message listener");
@@ -478,21 +525,21 @@ const AppContent = () => {
 
   // --- Message Management ---
   // Adds a message to the history, ensuring the context (activeQualia at the time) is stored.
-  // Adds a message to the history, ensuring the context (activeQualia at the time) is stored.
-  // New: optional third parameter `prependIfMatch` will, when true, prepend the new text
+  // New: optional third parameter `appendToLast` will, when true, prepend the new text
   // onto the last message if that message has the same isThought/contextId/contextName.
   const addMessage = useCallback(
-    (text: string, fromQualiaId: string, options: { appendToLast?: boolean } = {}) => {
+    (text: string, fromQualiaId: string, options: { appendToLast?: boolean, deliveryTime?: Timestamp, id?: string } = {}) => {
       if (!activeQualia) return;
       if (text.length === 0) return;
 
       const isThought = fromQualiaId !== activeQualia.id;
       const newMessage: Message = {
-        id: Date.now().toString() + Math.random(),
+        id: options.id || Date.now().toString() + Math.random(),
         text,
         isThought,
         contextId: activeQualia.id,
         contextName: activeQualia.name,
+        deliveryTime: options.deliveryTime || Timestamp.now(),
       };
 
       setMessages((prevMessages) => {
@@ -520,19 +567,19 @@ const AppContent = () => {
     const items = [];
     let lastContextId = null;
 
-    for (let i = 0; i < messages.length; i++) {
+    for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i];
 
       // Check if context switched compared to the last message processed
       if (lastContextId !== null && message.contextId !== lastContextId) {
         // Context switch detected. We need the name of the previous context.
-        const previousMessage = messages[i - 1];
+        const previousMessage = messages[i + 1];
         if (previousMessage) {
           // Requirement: add a subtle delimiter with name of the previous qualia
           const delimiter = {
             id: `delimiter-${message.id}`,
             type: "delimiter",
-            text: `(Context switch from ${previousMessage.contextName})`,
+            text: `(Context switch from ${previousMessage.contextName} ${lastContextId} ${JSON.stringify(message.contextId)}, ${JSON.stringify(previousMessage.contextId)})`,
           };
           items.push(delimiter);
         }
@@ -559,7 +606,7 @@ const AppContent = () => {
           if (isThought) {
             message = `[${communication.fromQualiaName}]: ${communication.message}`;
           }
-          addMessage(message, communication.fromQualiaId);
+          addMessage(message, communication.fromQualiaId, { deliveryTime: communication.deliveryTime, id: communication.id });
         }),
     );
     return () => {
@@ -754,14 +801,6 @@ const AppContent = () => {
 
   const modeText = isThinkingMode ? "Thinking" : "Speaking";
 
-  // Ensure FlatList scrolls to bottom on new messages (using displayMessages which includes delimiters)
-  useEffect(() => {
-    if (displayMessages.length > 0) {
-      // Use optional chaining to avoid calling scrollToEnd on a null ref
-      setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 50);
-    }
-  }, [displayMessages]);
-
   return (
     // SafeAreaView ensures content is below the status bar/notch and clickable on all platforms
     <SafeAreaView
@@ -796,20 +835,38 @@ const AppContent = () => {
 
         {/* Chat Area */}
         <FlatList
-          ref={flatListRef}
           data={displayMessages}
-          renderItem={({ item }) => (
+          renderItem={({ item, index }) => (
             <MessageItem
               item={item}
               theme={theme}
               isTalkingToSelf={isTalkingToSelf}
+              hasScrolled={hasScrolled}
             />
           )}
           keyExtractor={(item) => item.id}
           style={styles.chatList}
           contentContainerStyle={styles.chatListContent}
           keyboardShouldPersistTaps="handled"
-          scrollEventThrottle={16}
+          inverted
+          onEndReachedThreshold={0.5}
+          onEndReached={() => {
+            if (!isLoadingHistory) {
+              fetchHistory();
+            }
+          }}
+          onScroll={() => {
+            if (!hasScrolled) {
+              setHasScrolled(true);
+            }
+          }}
+          overScrollMode="always"
+          showsVerticalScrollIndicator={false}
+          // ListHeaderComponent={<View style={{ height: flatListHeight }} />}
+          onLayout={(event) => {
+            console.log("height", event.nativeEvent.layout.height)
+            setFlatListHeight(event.nativeEvent.layout.height);
+          }}
         />
 
         {/* Input Area */}
