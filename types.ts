@@ -30,6 +30,7 @@ export interface Communication {
   message: string;
   // Instead of boolean, it is status enum
   ack: boolean;
+  seen?: boolean;
   processingBefore?: Timestamp;
   reasoning?: string;
   fromQualiaId: string;
@@ -38,6 +39,7 @@ export interface Communication {
   context?: string;
   delaySeconds?: number;
   deliveryTime?: Timestamp;
+  receivedTime?: Timestamp;
   isoDeliveryTime?: string;
 }
 
@@ -95,26 +97,55 @@ export interface Communications {
   communications: Communication[];
 }
 
+export interface QualiaNode {
+  id: string;
+  conclusion: string;
+  assumptionIds: string[];
+  timestamp: Timestamp;
+}
+
 export interface QualiaDoc {
   qualiaId: string;
-  content: string[];
+  nodes: Record<string, QualiaNode>;
   nextQualiaDocId: string;
   processingBefore?: Timestamp;
 }
 
-export interface CompactedQualia {
-  reasoning?: string;
-  qualia: string;
-}
-
-export const QUALIA_SCHEMA = Schema.object({
+export const INTEGRATION_SCHEMA = Schema.object({
   properties: {
     reasoning: Schema.string(),
-    qualia: Schema.string(),
+    operations: Schema.array({
+      items: Schema.object({
+        properties: {
+          reasoning: Schema.string({ description: "Optional scratch place to think about the operation." }),
+          type: Schema.enumString({ enum: ["CREATE", "DELETE"], description: "Type of operation." }),
+          createId: Schema.string({ description: "Unique ID for the new conclusion. Required for CREATE." }),
+          conclusion: Schema.string({ description: "The content of the new conclusion. Required for CREATE." }),
+          assumptions: Schema.array({ items: Schema.string(), description: "List of IDs of existing conclusions to be used as assumptions for the new conclusion. Required for CREATE." }),
+          deleteIds: Schema.array({ items: Schema.string(), description: "List of IDs of conclusions to delete. Required for DELETE. Note: If an assumption is deleted, all its parent conclusions must also be deleted (and recreated with appropriate assumptions if needed)." }),
+        },
+        propertyOrdering: ["reasoning", "type", "createId", "conclusion", "assumptions", "deleteIds"],
+        optionalProperties: ["reasoning", "createId", "conclusion", "assumptions", "deleteIds"],
+      }),
+    }),
   },
-  propertyOrdering: ["reasoning", "qualia"],
+  propertyOrdering: ["reasoning", "operations"],
   optionalProperties: ["reasoning"],
 });
+
+export interface IntegrationOperation {
+  reasoning?: string;
+  type: "CREATE" | "DELETE";
+  createId?: string;
+  conclusion?: string;
+  assumptions?: string[];
+  deleteIds?: string[];
+}
+
+export interface IntegrationResponse {
+  reasoning?: string;
+  operations: IntegrationOperation[];
+}
 
 export interface Qualia {
   qualiaId: string;

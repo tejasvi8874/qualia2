@@ -14,7 +14,8 @@ import {
 import { getGenerativeModel, HarmBlockThreshold, HarmCategory, ObjectSchema, GenerativeModel } from "firebase/ai";
 
 
-import { Communications, Communication, Contact, Contacts, QualiaDoc, Qualia, CompactedQualia } from "./types";
+import { Communications, Communication, Contact, Contacts, QualiaDoc, Qualia, IntegrationResponse, IntegrationOperation, INTEGRATION_SCHEMA, COMMUNICATION_SCHEMA } from "./types";
+import { serializeQualia, applyOperations, detectCycles, GraphValidationError, BaseGraphCorruptionError } from "./graphUtils";
 
 async function generateContentNonStreaming(model: GenerativeModel, prompt: string) {
     const result = await model.generateContentStream(prompt);
@@ -43,34 +44,49 @@ Runs in background, handles all communications. Designed to run on device or in 
 import { communicationsCollection, contactsCollection, getMessageListener, getUserId, qualiaDocsCollection } from "./firebase";
 import { getContacts, getQualia } from "./firebaseClientUtils";
 import { ai, db } from "./firebaseAuth";
-import { COMMUNICATION_SCHEMA } from "./types";
-import { QUALIA_SCHEMA } from "./types";
 import { BASE_QUALIA } from "./constants";
 import { RateLimiter, withRetry } from "./requestUtils";
 
 export async function messageListener() {
-    return getMessageListener(await getUserId(), await communicationsCollection(), where("communicationType", "!=", "QUALIA_TO_HUMAN"), messageHandler, true);
+    return getMessageListener(await getUserId(), await communicationsCollection(), where("communicationType", "!=", "QUALIA_TO_HUMAN"), messageHandler, true, "seen");
 }
 
 const safetySettings = Object.values(HarmCategory).map((category) => ({ category, threshold: HarmBlockThreshold.BLOCK_NONE }));
 // pro, flash, flash-lite
-const proModel = (schema: ObjectSchema) => getGenerativeModel(ai, { model: "gemini-2.5-pro", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 32768 }, }, safetySettings }, {timeout: 1200 * 1e3});
+const proModel = (schema: ObjectSchema) => getGenerativeModel(ai, { model: "gemini-3-pro-preview", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 32768 }, }, safetySettings }, { timeout: 1200 * 1e3 });
 const communicationModel = proModel(COMMUNICATION_SCHEMA);
-const compactionModel = proModel(QUALIA_SCHEMA);
+const integrationModel = proModel(INTEGRATION_SCHEMA);
 
 const getResponseCommunicationsRateLimiter = new RateLimiter(60);
 
-async function getResponseCommunications(qualiaDocContent: string[], qualia: Qualia, communication: Partial<Communication>): Promise<Communications> {
+async function getResponseCommunications(qualiaDoc: QualiaDoc, qualia: Qualia, communication: Partial<Communication>): Promise<Communications> {
     console.log("Awaiting rate limiter...");
     await getResponseCommunicationsRateLimiter.acquire();
     console.log("Rate limiter acquired");
-    const prompt = `Generate new commmunications if required, keeping previous conversations in mind:\n${JSON.stringify({ myQualiaId: qualia.qualiaId, qualia: qualiaDocContent, money: qualia.money, communication: communication })}`;
+
+    // Fetch pending communications for context
+    const pendingCommunications = await getPendingCommunications(qualia.qualiaId);
+
+    const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
+    const prompt = `Generate new commmunications if required, keeping previous conversations in mind:\n${JSON.stringify({ myQualiaId: qualia.qualiaId, qualia: serializedQualia, money: qualia.money, communication: communication })}`;
     console.log(`Calling Gemini with prompt: ${prompt.substring(0, 100)}...`);
     const result = await generateContentNonStreaming(communicationModel, prompt);
     const response = JSON.parse(result.response.text());
     console.log(`Received response from Gemini: ${JSON.stringify(response)}`);
     return response;
 }
+
+async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunications: Communication[], errorInfo?: string): Promise<IntegrationResponse> {
+    const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
+    let prompt = `Integrate pending communications into the qualia by performing a series of operations on the graph:\n${JSON.stringify({ qualia: serializedQualia })}`;
+    if (errorInfo) {
+        prompt += `\n\nPrevious integration attempt failed: ${errorInfo}. Please resolve.`;
+    }
+    console.log(`Calling Gemini for integration with prompt length: ${prompt.length}`);
+    const result = await generateContentNonStreaming(integrationModel, prompt);
+    return JSON.parse(result.response.text());
+}
+
 
 const MAX_COMPACTION_PROCESSING_SECONDS = 1200;
 const NETWORK_DELAY_SECONDS = 2;
@@ -90,18 +106,83 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
     if (!qualiaDocSnapshot.exists()) {
         throw new Error("Qualia doc does not exist for compaction");
     }
-    const oldQualia = qualiaDocSnapshot.data() as QualiaDoc;
-    if (oldQualia.nextQualiaDocId !== "") {
-        return doc(await qualiaDocsCollection(), oldQualia.nextQualiaDocId);
+    let qualiaDoc = qualiaDocSnapshot.data() as QualiaDoc;
+    if (qualiaDoc.nextQualiaDocId !== "") {
+        return doc(await qualiaDocsCollection(), qualiaDoc.nextQualiaDocId);
     }
-    const prompt = `Initiate sleep:\n${JSON.stringify(oldQualia.content)}`;
-    console.log(`Calling Gemini with prompt: ${prompt.substring(0, 100)}...`);
-    console.log(prompt);
-    const result = await generateContentNonStreaming(compactionModel, prompt);
-    const parsed = JSON.parse(result.response.text()) as CompactedQualia;
-    const newQualiaDocContent = parsed.qualia;
 
-    const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), { content: [newQualiaDocContent], qualiaId: oldQualia.qualiaId, nextQualiaDocId: "" });
+    // Compaction loop
+    let serializedSize = serializeQualia(qualiaDoc).length; // Initial check without pending? Or should we include?
+    // Size check should probably include pending to be accurate about "total state size"
+    const pendingCommunications = await getPendingCommunications(qualiaDoc.qualiaId);
+    serializedSize = serializeQualia(qualiaDoc, pendingCommunications).length;
+
+    const THRESHOLD = 10000; // Example threshold
+
+    while (serializedSize > THRESHOLD) {
+        console.log(`Qualia size ${serializedSize} exceeds threshold ${THRESHOLD}. Triggering integration/reduction.`);
+
+        // Refresh pending communications in loop?
+        const currentPending = await getPendingCommunications(qualiaDoc.qualiaId);
+        const serializedQualia = serializeQualia(qualiaDoc, currentPending);
+        const prompt = `Qualia is exceeding size limit. Integrate pending communications AND perform at least one DELETE operation to reduce size:\n${JSON.stringify({ qualia: serializedQualia })}`;
+
+        let ops: IntegrationResponse | undefined;
+        let errorInfo: string | undefined;
+
+        // Retry loop for validation/cycles
+        while (true) {
+            try {
+                const currentPrompt = errorInfo ? prompt + `\n\nPrevious attempt failed: ${errorInfo}` : prompt;
+                const result = await generateContentNonStreaming(integrationModel, currentPrompt);
+                ops = JSON.parse(result.response.text()) as IntegrationResponse;
+
+                const newDoc = applyOperations(qualiaDoc, ops.operations);
+
+                const cycles = detectCycles(newDoc);
+                if (cycles) {
+                    errorInfo = `Cycle detected: ${JSON.stringify(cycles)}. Please retry without creating cycles.`;
+                    console.log(errorInfo);
+                    continue;
+                }
+
+                // Success
+                qualiaDoc = newDoc;
+                break;
+
+            } catch (e) {
+                // Base graph corruption - fail permanently
+                if (e instanceof BaseGraphCorruptionError) {
+                    console.error("Base graph corruption during compaction:", e.message);
+                    throw e;
+                }
+                // Operation validation errors - retry with context
+                if (e instanceof GraphValidationError) {
+                    errorInfo = `Validation failed: ${e.message}. Ensure all referred IDs exist.`;
+                    console.log(errorInfo);
+                    continue;
+                }
+                throw e;
+            }
+        }
+
+        // Mark integrated communications as acked
+        await markCommunicationsAsAcked(currentPending);
+
+        serializedSize = serializeQualia(qualiaDoc, []).length; // Check size of graph only? Or fetch pending again?
+        // If we just acked them, they won't be pending anymore.
+    }
+
+    // After loop, save the compacted qualia to a NEW doc?
+    // User said: "Convert each node and its children to a json format ... and at the end simply serialize the list of jsons."
+    // "The new communications need to be integrated into the qualia ... result of integration is a list of operations"
+    // "Compaction ... trigger integration process ... Stop the loop when ... under limit."
+
+    // It seems compaction IS integration until size is small.
+    // So we just update the CURRENT doc? Or create a new one?
+    // Existing code creates a new doc. Let's stick to that pattern to be safe/immutable-ish.
+
+    const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), { ...qualiaDoc, nextQualiaDocId: "" });
     console.log(`New qualia doc created: ${newQualiaDocRef.id}`);
     await updateDoc(qualiaDocRef, { nextQualiaDocId: newQualiaDocRef.id, processingBefore: null });
     return newQualiaDocRef;
@@ -220,7 +301,7 @@ async function messageHandler(communication: Communication): Promise<void> {
     create new communications
     */
     const qualiaDocRef = await getQualiaDocRef(qualiaId);
-    const qualiaDoc = (await getDoc(qualiaDocRef)).data() as QualiaDoc;
+    let qualiaDoc = (await getDoc(qualiaDocRef)).data() as QualiaDoc;
     console.log(`Retrieved qualia doc: ${JSON.stringify(qualiaDoc).substring(0, 100)}...`);
 
     let relevantCommunication: Partial<Communication>;
@@ -250,28 +331,26 @@ async function messageHandler(communication: Communication): Promise<void> {
         }];
     }
     relevantCommunication.isoDeliveryTime = new Date().toISOString();
-    const communications = await getResponseCommunications(qualiaDoc.content, await getQualia(qualiaId), relevantCommunication);
-    if (communications.communications.length === 0) {
-        console.log(`No new communications generated.`);
-        return;
+
+    // Set receivedTime to mark when this message was processed
+    if (communication.id) {
+        const commRef = doc(await communicationsCollection(), communication.id);
+        await updateDoc(commRef, { receivedTime: Timestamp.now() });
     }
+
+    // Generate response communications
+    const communications = await getResponseCommunications(qualiaDoc, await getQualia(qualiaId), relevantCommunication);
+
     const validCommunications: Communication[] = [];
-    for (const comm of communications.communications) {
-        validCommunications.push(await getValidCommunication(comm));
+    if (communications.communications.length > 0) {
+        for (const comm of communications.communications) {
+            validCommunications.push(await getValidCommunication(comm));
+        }
+    } else {
+        console.log(`No new communications generated.`);
     }
-    await updateDoc(qualiaDocRef, {
-        content: arrayUnion(...([communication, ...validCommunications]
-            .filter((comm) => !(comm.toQualiaId === qualiaId && comm.communicationType === "QUALIA_TO_QUALIA"))
-            .map((comm) => {
-                if (comm.deliveryTime) {
-                    comm = { ...comm, isoDeliveryTime: comm.deliveryTime.toDate().toISOString() };
-                    delete comm.deliveryTime;
-                }
-                return JSON.stringify(comm);
-            }))),
-    });
-    console.log(`Qualia doc updated with new communications.`);
-    // TODO: Consider adding timestamps to conversations. It is not delivery time.
+
+    // Send outgoing messages
     await Promise.all(validCommunications.map(comm => communicationsCollection().then(
         collection => addDoc(collection, comm))));
     console.log(`All communications added to collection.`);
@@ -287,14 +366,153 @@ async function messageHandler(communication: Communication): Promise<void> {
     }
     await updateContacts(contacts);
     console.log(`Message handling complete for communication: ${JSON.stringify(communication)}`);
-    console.log(`For the communication:\n${JSON.stringify(communication)}\n\nGenerated below communications:\n ${JSON.stringify(validCommunications)}`)
+}
+
+export async function startIntegrationLoop(qualiaId: string) {
+    console.log(`Starting integration loop for qualiaId: ${qualiaId}`);
+    while (true) {
+        try {
+            const qualiaDocRef = await getQualiaDocRef(qualiaId);
+            await attemptIntegration(qualiaDocRef, qualiaId);
+        } catch (e) {
+            console.error("Error in integration loop:", e);
+        }
+        // Wait before next iteration to avoid tight loop if nothing to do, 
+        // but user said "continuous loop". A small delay is probably good practice.
+        await new Promise(resolve => setTimeout(resolve, 5000));
+    }
+}
+
+async function getPendingCommunications(qualiaId: string): Promise<Communication[]> {
+    const q = query(
+        await communicationsCollection(),
+        where("toQualiaId", "==", qualiaId),
+        where("ack", "==", false)
+    );
+    const snapshot = await getDocs(q);
+    const communications: Communication[] = [];
+    snapshot.forEach((doc) => {
+        communications.push({ id: doc.id, ...doc.data() } as Communication);
+    });
+    return communications;
+}
+
+async function markCommunicationsAsAcked(communications: Communication[]) {
+    const batch = [];
+    for (const comm of communications) {
+        if (comm.id) {
+            const commRef = doc(await communicationsCollection(), comm.id);
+            await updateDoc(commRef, { ack: true });
+        }
+    }
+}
+
+async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: string) {
+    const claimed = await runTransaction(db, async (transaction) => {
+        const docSnap = await transaction.get(qualiaDocRef);
+        if (!docSnap.exists()) return false;
+        const data = docSnap.data() as QualiaDoc;
+
+        if (data.processingBefore && getTimeToWait(data.processingBefore.toMillis()) > 0) {
+            return false; // Locked
+        }
+
+        transaction.update(qualiaDocRef, { processingBefore: Timestamp.fromMillis(Date.now() + COMPACTION_PROCESSING_SECONDS * 1e3) });
+        return true;
+    });
+
+    if (!claimed) return;
+
+    console.log(`Integration started for qualia ${qualiaId}`);
+
+    try {
+        // Fetch fresh data
+        const docSnap = await getDoc(qualiaDocRef);
+        let qualiaDoc = docSnap.data() as QualiaDoc;
+
+        // Fetch pending communications
+        const pendingCommunications = await getPendingCommunications(qualiaId);
+
+        // Skip if no pending communications and graph is empty
+        if (pendingCommunications.length === 0 && Object.keys(qualiaDoc.nodes || {}).length === 0) {
+            console.log('No pending communications and empty graph - skipping integration');
+            return;
+        }
+
+        let errorInfo: string | undefined;
+        let newDoc: QualiaDoc | undefined;
+
+        // Retry loop (only for operation errors, not base graph corruption)
+        let lastOperations: IntegrationOperation[] | undefined;
+        while (true) {
+            try {
+                const integrationResult = await integrateCommunications(qualiaDoc, pendingCommunications, errorInfo);
+                lastOperations = integrationResult.operations;
+                newDoc = applyOperations(qualiaDoc, integrationResult.operations);
+
+                const cycles = detectCycles(newDoc);
+                if (cycles) {
+                    errorInfo = `Cycle detected: ${JSON.stringify(cycles)}. Please retry without creating cycles.`;
+                    if (lastOperations) {
+                        errorInfo += `\nAttempted operations: ${JSON.stringify(lastOperations)}`;
+                    }
+                    console.log(errorInfo);
+                    continue;
+                }
+
+                // Success
+                break;
+            } catch (e) {
+                // Base graph corruption - fail permanently, don't retry
+                if (e instanceof BaseGraphCorruptionError) {
+                    console.error("Base graph corruption detected:", e.message);
+                    await updateDoc(qualiaDocRef, { processingBefore: null });
+                    throw e; // Propagate to caller/UI
+                }
+                // Operation validation errors - retry with context
+                if (e instanceof GraphValidationError) {
+                    errorInfo = `Validation failed: "${e.message}". Ensure a conclusion with that ID exist before specifying it as an assumption.`;
+                    if (lastOperations) {
+                        errorInfo += `\nAttempted operations: ${JSON.stringify(lastOperations)}`;
+                    }
+                    console.log(errorInfo);
+                    continue;
+                }
+                throw e;
+            }
+        }
+
+        // Success. Create new doc and link from old.
+        const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), {
+            ...newDoc!,
+            nextQualiaDocId: "",
+            processingBefore: null
+        });
+
+        await updateDoc(qualiaDocRef, {
+            nextQualiaDocId: newQualiaDocRef.id,
+            processingBefore: null
+        });
+
+        console.log(`Created new qualia doc: ${newQualiaDocRef.id} from integration`);
+
+        // Mark communications as acked
+        await markCommunicationsAsAcked(pendingCommunications);
+
+        console.log("Integration successful.");
+
+    } catch (e) {
+        console.error("Error during integration:", e);
+        // Release lock?
+        await updateDoc(qualiaDocRef, { processingBefore: null });
+        throw e;
+    }
 }
 
 async function getQualiaDocRef(qualiaId: string) {
     let qualiaDocRef = await getQualiaDoc(qualiaId);
     const qualiaDoc = (await getDoc(qualiaDocRef)).data() as QualiaDoc;
-    const qualiaDocString = JSON.stringify(qualiaDoc);
-    console.log("Qualia doc size: ", qualiaDocString.length);
+    const qualiaDocString = serializeQualia(qualiaDoc);
     if (qualiaDocString.length > 2 ** 20) {
         qualiaDocRef = await qualiaCompaction(qualiaDocRef);
     }
@@ -305,7 +523,7 @@ async function getValidCommunication(communication: Communication): Promise<Comm
     console.log(`Validating communication: ${JSON.stringify(communication)}`);
     let errorMessage = "";
     communication.communicationType = communication.communicationType.trim() as Communication["communicationType"];
-    if (communication.communicationType === "QUALIA_TO_HUMAN") {
+    if (communication.communicationType === "HUMAN_TO_QUALIA") {
         if (communication.fromQualiaId === undefined) {
             communication.fromQualiaId = await getUserId();
         } else if (communication.fromQualiaId !== await getUserId()) {
@@ -390,7 +608,6 @@ async function getValidCommunication(communication: Communication): Promise<Comm
 }
 
 async function getQualiaDoc(qualiaId: string): Promise<DocumentReference> {
-    console.log(`Getting qualia doc for qualiaId: ${qualiaId}`);
     const q = query(
         await qualiaDocsCollection(),
         where("qualiaId", "==", qualiaId),
@@ -400,16 +617,11 @@ async function getQualiaDoc(qualiaId: string): Promise<DocumentReference> {
     const docs = snapshot.docs;
     if (docs.length === 0) {
         // Create initial qualia doc
-        const initialQualiaDoc: QualiaDoc = { qualiaId: qualiaId, content: [BASE_QUALIA], nextQualiaDocId: "", };
-        console.log(`Creating initial qualia doc: ${JSON.stringify(initialQualiaDoc)}`);
+        const initialQualiaDoc: QualiaDoc = { qualiaId: qualiaId, nodes: {}, nextQualiaDocId: "", };
         return await addDoc(await qualiaDocsCollection(), initialQualiaDoc);
     }
     if (docs.length > 1) {
-        console.error(`Unique qualia doc not found: ${JSON.stringify(docs)}`);
         throw new Error(`Unique qualia doc not found: ${docs}`);
     }
-    console.log(`Retrieved qualia doc ref: ${docs[0].ref.path}`);
     return docs[0].ref;
 }
-
-

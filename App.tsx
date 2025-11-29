@@ -23,7 +23,7 @@ import { WebView } from "react-native-webview";
 import { sendMessage, registerClientMessageClb, getContacts, updateContacts, getHistoricalMessages } from "./firebaseClientUtils";
 import { Communication, ContextQualia } from "./types";
 import { Timestamp } from "firebase/firestore";
-import { messageListener } from "./server";
+import { messageListener, startIntegrationLoop } from "./server";
 import { auth } from "./firebaseAuth";
 import { RecaptchaVerifier } from "firebase/auth";
 import { firebaseConfig } from "./firebaseConfig";
@@ -358,6 +358,7 @@ const AppContent = () => {
   const [isCalling, setIsCalling] = useState(false);
   const webviewRef = useRef<WebView>(null);
   const [liveSession, setLiveSession] = useState<LiveSession | null>(null);
+  const [graphError, setGraphError] = useState<string | null>(null);
 
   useEffect(() => {
     const unsubscribe = auth.onAuthStateChanged((user) => {
@@ -370,10 +371,22 @@ const AppContent = () => {
         setActiveQualia(null);
         setMessages([]);
         setContacts([]);
+        setGraphError(null);
       }
     });
     return () => unsubscribe();
   }, []);
+
+  // Start integration loop when user is authenticated
+  useEffect(() => {
+    if (userId) {
+      console.log("Starting integration loop for user:", userId);
+      startIntegrationLoop(userId).catch((error) => {
+        console.error("Integration loop error:", error);
+        setGraphError(error.message || "An error occurred in the integration loop");
+      });
+    }
+  }, [userId]);
 
   const [contacts, setContacts] = useState<ContextQualia[]>([]);
   const [activeQualia, setActiveQualia] = useState<ContextQualia | null>(null);
@@ -419,8 +432,8 @@ const AppContent = () => {
   const fetchHistory = useCallback(async () => {
     if (!activeQualia || isLoadingHistory) return;
 
-    if (!activeQualia?.name){
-      throw new Error("No active qualia"+ JSON.stringify(activeQualia));
+    if (!activeQualia?.name) {
+      throw new Error("No active qualia" + JSON.stringify(activeQualia));
     }
     console.log("Fetching history...");
     setIsLoadingHistory(true);
@@ -440,7 +453,11 @@ const AppContent = () => {
           contextName: activeQualia?.name,
           isInitialHistory: isInitialLoad,
         }));
-        setMessages((prev) => [...newMessages, ...prev]);
+        setMessages((prev) => {
+          const existingIds = new Set(prev.map(m => m.id));
+          const uniqueNewMessages = newMessages.filter(m => !existingIds.has(m.id));
+          return [...uniqueNewMessages, ...prev];
+        });
       }
     } catch (error) {
       console.error("Error fetching historical messages:", error);
@@ -543,6 +560,11 @@ const AppContent = () => {
       };
 
       setMessages((prevMessages) => {
+        // Check for duplicates
+        if (prevMessages.some(m => m.id === newMessage.id)) {
+          return prevMessages;
+        }
+
         if (options.appendToLast && prevMessages.length > 0) {
           const last = prevMessages[prevMessages.length - 1];
 
@@ -833,6 +855,18 @@ const AppContent = () => {
           )}
         </View>
 
+        {/* Graph Error Banner */}
+        {graphError && (
+          <View style={[styles.errorBanner, { backgroundColor: '#ff4444' }]}>
+            <Text style={[styles.errorText, { color: '#ffffff' }]}>
+              Graph Error: {graphError}
+            </Text>
+            <TouchableOpacity onPress={() => setGraphError(null)} style={styles.errorDismiss}>
+              <Text style={{ color: '#ffffff', fontSize: 18, fontWeight: 'bold' }}>×</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
         {/* Chat Area */}
         <FlatList
           data={displayMessages}
@@ -1056,6 +1090,20 @@ const styles = StyleSheet.create({
     paddingVertical: 15,
     paddingHorizontal: 20,
     alignItems: "center",
+  },
+  errorBanner: {
+    padding: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  errorText: {
+    flex: 1,
+    fontSize: 14,
+    fontFamily: FONT_FAMILY,
+  },
+  errorDismiss: {
+    paddingLeft: 12,
   },
 });
 
