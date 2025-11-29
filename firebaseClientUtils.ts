@@ -22,13 +22,14 @@ export async function sendMessage({ message, contextQualia, toQualia }: { messag
     deliveryTime: Timestamp.now(),
     communicationType: "HUMAN_TO_QUALIA",
     ack: false,
+    seen: false,
   };
 
   await addDoc(await communicationsCollection(), communication);
 }
 
 export async function registerClientMessageClb(callback: (communication: Communication) => Promise<void>) {
-  return getMessageListener(await getUserId(), await communicationsCollection(), where("communicationType", "==", "QUALIA_TO_HUMAN"), callback, false);
+  return getMessageListener(await getUserId(), await communicationsCollection(), where("communicationType", "==", "QUALIA_TO_HUMAN"), callback, false, "seen");
 }
 
 export async function getContacts(): Promise<Contact[]> {

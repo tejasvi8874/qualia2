@@ -10,6 +10,7 @@ import {
     arrayUnion,
     runTransaction,
     doc,
+    onSnapshot,
 } from "firebase/firestore";
 import { getGenerativeModel, HarmBlockThreshold, HarmCategory, ObjectSchema, GenerativeModel } from "firebase/ai";
 
@@ -25,9 +26,6 @@ async function generateContentNonStreaming(model: GenerativeModel, prompt: strin
     for await (const chunk of result.stream) {
         try {
             text += chunk.text();
-            if (text.length % 200 === 0) {
-                console.log(text)
-            }
         } catch (error) {
             console.error(error);
             throw error;
@@ -53,8 +51,9 @@ export async function messageListener() {
 
 const safetySettings = Object.values(HarmCategory).map((category) => ({ category, threshold: HarmBlockThreshold.BLOCK_NONE }));
 // pro, flash, flash-lite
-const proModel = (schema: ObjectSchema) => getGenerativeModel(ai, { model: "gemini-3-pro-preview", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 32768 }, }, safetySettings }, { timeout: 1200 * 1e3 });
-const communicationModel = proModel(COMMUNICATION_SCHEMA);
+const proModel = (schema: ObjectSchema) => getGenerativeModel(ai, { model: "gemini-2.5-pro", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 32768 }, }, safetySettings }, { timeout: 1200 * 1e3 });
+const flashModel = (schema: ObjectSchema) => getGenerativeModel(ai, { model: "gemini-2.5-flash-preview-09-2025", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 24576 }, }, safetySettings }, { timeout: 1200 * 1e3 });
+const communicationModel = flashModel(COMMUNICATION_SCHEMA);
 const integrationModel = proModel(INTEGRATION_SCHEMA);
 
 const getResponseCommunicationsRateLimiter = new RateLimiter(60);
@@ -366,24 +365,80 @@ async function messageHandler(communication: Communication): Promise<void> {
     }
     await updateContacts(contacts);
     console.log(`Message handling complete for communication: ${JSON.stringify(communication)}`);
+
+    // Trigger integration immediately
+    // triggerIntegration(qualiaId);
+}
+
+const integrationStates = new Map<string, { promise: Promise<void> | null, pending: boolean }>();
+
+async function triggerIntegration(qualiaId: string) {
+    let state = integrationStates.get(qualiaId);
+    console.log("triggerIntegration", { qualiaId, state })
+    if (!state) {
+        state = { promise: null, pending: false };
+        integrationStates.set(qualiaId, state);
+    }
+
+    if (state.promise) {
+        state.pending = true;
+        return;
+    }
+
+    const run = async () => {
+        try {
+            const qualiaDocRef = await getQualiaDocRef(qualiaId);
+            await attemptIntegration(qualiaDocRef, qualiaId);
+        } catch (e) {
+            console.error(`Error in triggered integration for ${qualiaId}:`, e);
+        } finally {
+            state!.promise = null;
+            if (state!.pending) {
+                state!.pending = false;
+                triggerIntegration(qualiaId);
+            } else {
+                integrationStates.delete(qualiaId);
+            }
+        }
+    };
+
+    state.promise = run();
+}
+
+function startPendingCommunicationsListener(qualiaId: string) {
+    console.log(`Starting pending communications listener for ${qualiaId}`);
+    communicationsCollection().then(collection => {
+        const q = query(
+            collection,
+            where("toQualiaId", "==", qualiaId),
+            where("ack", "==", false)
+        );
+        onSnapshot(q, (snapshot) => {
+            if (snapshot.docs.length > 0) {
+                console.log(`Pending communications detected: ${snapshot.docs.length}. Triggering integration.`);
+                triggerIntegration(qualiaId);
+            }
+        });
+    });
 }
 
 export async function startIntegrationLoop(qualiaId: string) {
     console.log(`Starting integration loop for qualiaId: ${qualiaId}`);
+    startPendingCommunicationsListener(qualiaId);
     while (true) {
         try {
-            const qualiaDocRef = await getQualiaDocRef(qualiaId);
-            await attemptIntegration(qualiaDocRef, qualiaId);
+            // Use the central trigger with debounce logic
+            await triggerIntegration(qualiaId);
         } catch (e) {
             console.error("Error in integration loop:", e);
         }
         // Wait before next iteration to avoid tight loop if nothing to do, 
         // but user said "continuous loop". A small delay is probably good practice.
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        await new Promise(resolve => setTimeout(resolve, 500000));
     }
 }
 
-async function getPendingCommunications(qualiaId: string): Promise<Communication[]> {
+export async function getPendingCommunications(qualiaId: string): Promise<Communication[]> {
     const q = query(
         await communicationsCollection(),
         where("toQualiaId", "==", qualiaId),
@@ -408,6 +463,7 @@ async function markCommunicationsAsAcked(communications: Communication[]) {
 }
 
 async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: string) {
+    console.log("Attemping integration");
     const claimed = await runTransaction(db, async (transaction) => {
         const docSnap = await transaction.get(qualiaDocRef);
         if (!docSnap.exists()) return false;
@@ -509,7 +565,7 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
     }
 }
 
-async function getQualiaDocRef(qualiaId: string) {
+export async function getQualiaDocRef(qualiaId: string) {
     let qualiaDocRef = await getQualiaDoc(qualiaId);
     const qualiaDoc = (await getDoc(qualiaDocRef)).data() as QualiaDoc;
     const qualiaDocString = serializeQualia(qualiaDoc);
