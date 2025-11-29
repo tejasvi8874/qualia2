@@ -98,7 +98,6 @@ interface Theme {
 interface Message {
   id: string;
   text: string;
-  type?: string;
   isThought?: boolean;
   contextId?: string;
   contextName?: string;
@@ -429,105 +428,15 @@ const AppContent = () => {
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [hasScrolled, setHasScrolled] = useState(false);
 
-  const fetchHistory = useCallback(async () => {
-    if (!activeQualia || isLoadingHistory) return;
-
-    if (!activeQualia?.name) {
-      throw new Error("No active qualia" + JSON.stringify(activeQualia));
-    }
-    console.log("Fetching history...");
-    setIsLoadingHistory(true);
-
-    const oldestMessage = messages[0];
-    const before = oldestMessage?.deliveryTime || Timestamp.now();
-
-    try {
-      const historicalMessages = await getHistoricalMessages(before, 10);
-      if (historicalMessages.length > 0) {
-        const newMessages = historicalMessages.map((msg) => ({
-          ...msg,
-          id: msg.id || `${msg.deliveryTime?.toMillis()}-${Math.random()}`,
-          text: msg.message,
-          isThought: msg.fromQualiaId !== activeQualia?.id,
-          contextId: activeQualia?.id,
-          contextName: activeQualia?.name,
-          isInitialHistory: isInitialLoad,
-        }));
-        setMessages((prev) => {
-          const existingIds = new Set(prev.map(m => m.id));
-          const uniqueNewMessages = newMessages.filter(m => !existingIds.has(m.id));
-          return [...uniqueNewMessages, ...prev];
-        });
-      }
-    } catch (error) {
-      console.error("Error fetching historical messages:", error);
-    } finally {
-      setIsLoadingHistory(false);
-    }
-  }, [messages, isLoadingHistory, activeQualia, isInitialLoad]);
-
-  useEffect(() => {
-    // Fetch initial message history when the active qualia is set
-    if (activeQualia && isInitialLoad) {
-      fetchHistory();
-      setIsInitialLoad(false);
-    }
-  }, [activeQualia, isInitialLoad, fetchHistory]);
-
-  const handleSignOut = useCallback(() => {
-    auth.signOut();
-    setIsSwitcherVisible(false);
-  }, []);
-
-  const handleCall = async () => {
-    if (isCalling) {
-      console.log("Ending call.");
-      if (Platform.OS === 'web') {
-        if (liveSession) {
-          liveSession.close();
-        }
-      } else {
-        webviewRef.current?.postMessage('stop');
-      }
-    } else {
-      console.log("Starting call.");
-      addMessage("(Call started)", "ui");
-      setIsCalling(true);
-      if (Platform.OS === 'web') {
-        const session = await startAudioSession(
-          (type, text) => { // onTranscriptPart
-            const isContinuing = lastTranscriptType.current === type;
-            addMessage(text, type, { appendToLast: isContinuing });
-            lastTranscriptType.current = type;
-          },
-          (type, text) => { // onTranscriptFlush
-            if (type === 'ended') {
-              setIsCalling(false);
-              setLiveSession(null);
-              addMessage("(Call ended)", "ui");
-              lastTranscriptType.current = null;
-            } else {
-              lastTranscriptType.current = null;
-              // In future, send `text` to qualia.
-            }
-          }
-        );
-        setLiveSession(session);
-      } else {
-        webviewRef.current?.postMessage('start');
-      }
-    }
-  };
-
   // Derived State for UI presentation
   const isTalkingToSelf = useMemo(() => {
     return userQualia && activeQualia ? activeQualia.id === userQualia.id : false;
   }, [userQualia, activeQualia]);
 
-  // Refs
   const inputRef = useRef<TextInput>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSentIndexRef = useRef(0);
+  const currentStreamDeliveryTime = useRef<Timestamp | null>(null);
   const [flatListHeight, setFlatListHeight] = useState(0);
 
   useEffect(() => {
@@ -746,6 +655,103 @@ const AppContent = () => {
     setTimeout(() => inputRef.current?.focus(), 50);
   }, [userQualia, finalizeInput, isThinkingMode, isTalkingToSelf]);
 
+  const fetchHistory = useCallback(async () => {
+    if (!activeQualia || isLoadingHistory) return;
+
+    if (!activeQualia?.name) {
+      throw new Error("No active qualia" + JSON.stringify(activeQualia));
+    }
+    console.log("Fetching history...");
+    setIsLoadingHistory(true);
+
+    const oldestMessage = messages[0];
+    const before = oldestMessage?.deliveryTime || Timestamp.now();
+
+    try {
+      const historicalMessages = await getHistoricalMessages(before, 10);
+      if (historicalMessages.length > 0) {
+        const newMessages = historicalMessages.map((msg) => ({
+          ...msg,
+          id: msg.id || `${msg.deliveryTime?.toMillis()}-${Math.random()}`,
+          text: msg.message,
+          isThought: msg.fromQualiaId !== activeQualia?.id,
+          contextId: activeQualia?.id,
+          contextName: activeQualia?.name,
+          isInitialHistory: isInitialLoad,
+        }));
+        setMessages((prev) => {
+          const existingIds = new Set(prev.map(m => m.id));
+          const uniqueNewMessages = newMessages.filter(m => !existingIds.has(m.id));
+          return [...uniqueNewMessages, ...prev];
+        });
+      }
+    } catch (error) {
+      console.error("Error fetching historical messages:", error);
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  }, [messages, isLoadingHistory, activeQualia, isInitialLoad]);
+
+  useEffect(() => {
+    // Fetch initial message history when the active qualia is set
+    if (activeQualia && isInitialLoad) {
+      fetchHistory();
+      setIsInitialLoad(false);
+    }
+  }, [activeQualia, isInitialLoad, fetchHistory]);
+
+  const handleSignOut = useCallback(() => {
+    auth.signOut();
+    setIsSwitcherVisible(false);
+  }, []);
+
+  const handleCall = async () => {
+    if (isCalling) {
+      console.log("Ending call.");
+      if (Platform.OS === 'web') {
+        if (liveSession) {
+          liveSession.close();
+        }
+      } else {
+        webviewRef.current?.postMessage('stop');
+      }
+    } else {
+      console.log("Starting call.");
+      addMessage("(Call started)", "ui");
+      setIsCalling(true);
+      if (Platform.OS === 'web') {
+        const session = await startAudioSession(
+          (type, text) => { // onTranscriptPart
+            const isContinuing = lastTranscriptType.current === type;
+            if (!isContinuing) {
+              currentStreamDeliveryTime.current = Timestamp.now();
+            }
+            addMessage(text, type, {
+              appendToLast: isContinuing,
+              deliveryTime: currentStreamDeliveryTime.current || Timestamp.now()
+            });
+            lastTranscriptType.current = type;
+          },
+          (type, text) => { // onTranscriptFlush
+            if (type === 'ended') {
+              setIsCalling(false);
+              setLiveSession(null);
+              addMessage("(Call ended)", "ui");
+              lastTranscriptType.current = null;
+              currentStreamDeliveryTime.current = null;
+            } else {
+              lastTranscriptType.current = null;
+              currentStreamDeliveryTime.current = null;
+              // In future, send `text` to qualia.
+            }
+          }
+        );
+        setLiveSession(session);
+      } else {
+        webviewRef.current?.postMessage('start');
+      }
+    }
+  };
   // Handles the creation flow logic
   const createAndSwitchToQualia = useCallback(
     (name: string) => {
