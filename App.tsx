@@ -22,7 +22,7 @@ import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 import { sendMessage, registerClientMessageClb, getContacts, updateContacts, getHistoricalMessages } from "./firebaseClientUtils";
 import { Communication, ContextQualia, QualiaDoc } from "./types";
-import { Timestamp, getDoc, addDoc } from "firebase/firestore";
+import { Timestamp, getDoc, addDoc, writeBatch, doc } from "firebase/firestore";
 import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef } from "./server";
 import { serializeQualia } from "./graphUtils";
 import { auth, db } from "./firebaseAuth";
@@ -707,6 +707,95 @@ const AppContent = () => {
     setIsSwitcherVisible(false);
   }, []);
 
+  const onTranscriptPart = useCallback((type: 'user' | 'gemini', text: string) => {
+    let content = text;
+    if (type === 'user' && content && content === content.toUpperCase() && /[a-zA-Z]/.test(content)) {
+      content = content.charAt(0).toUpperCase() + content.slice(1).toLowerCase();
+    }
+
+    const isContinuing = lastTranscriptType.current === type;
+    if (!isContinuing) {
+      currentStreamDeliveryTime.current = Timestamp.now();
+    }
+    addMessage(content, type === 'user' ? (userQualia?.id || 'user') : (activeQualia?.id || 'gemini'), {
+      appendToLast: isContinuing,
+      deliveryTime: currentStreamDeliveryTime.current || Timestamp.now()
+    });
+    lastTranscriptType.current = type;
+  }, [userQualia, activeQualia, addMessage]);
+
+  const pendingUserCommunication = useRef<Communication | null>(null);
+
+  const onTranscriptFlush = useCallback(async (type: 'user' | 'gemini' | 'ended', text: string) => {
+    if (type === 'ended') {
+      setIsCalling(false);
+      setLiveSession(null);
+      addMessage("(Call ended)", "ui");
+      lastTranscriptType.current = null;
+      currentStreamDeliveryTime.current = null;
+
+      // Flush any pending user communication
+      if (pendingUserCommunication.current) {
+        addDoc(await communicationsCollection(), pendingUserCommunication.current);
+        pendingUserCommunication.current = null;
+      }
+    } else {
+      lastTranscriptType.current = null;
+      currentStreamDeliveryTime.current = null;
+
+      // Persist transcript
+      if (activeQualia && userQualia) {
+        let content = text;
+        if (type === 'user' && content && content === content.toUpperCase() && /[a-zA-Z]/.test(content)) {
+          content = content.charAt(0).toUpperCase() + content.slice(1).toLowerCase();
+        }
+
+        const deliveryTime = Timestamp.now();
+        if (type === 'user') {
+          const communication: Communication = {
+            fromQualiaId: userQualia.id,
+            fromQualiaName: userQualia.name,
+            toQualiaId: activeQualia.id,
+            toQualiaName: activeQualia.name,
+            message: content,
+            communicationType: "HUMAN_TO_QUALIA",
+            ack: false,
+            seen: true,
+            deliveryTime: deliveryTime,
+          };
+          // Store for batching
+          pendingUserCommunication.current = communication;
+        } else if (type === 'gemini') {
+          const batch = writeBatch(db);
+          const collection = await communicationsCollection();
+
+          // Add pending user communication if exists
+          if (pendingUserCommunication.current) {
+            const userDocRef = doc(collection);
+            batch.set(userDocRef, pendingUserCommunication.current);
+            pendingUserCommunication.current = null;
+          }
+
+          const communication: Communication = {
+            fromQualiaId: activeQualia.id,
+            fromQualiaName: activeQualia.name,
+            toQualiaId: userQualia.id,
+            toQualiaName: userQualia.name,
+            message: text,
+            communicationType: "QUALIA_TO_HUMAN",
+            ack: false,
+            seen: true,
+            deliveryTime: deliveryTime
+          };
+          const geminiDocRef = doc(collection);
+          batch.set(geminiDocRef, communication);
+
+          await batch.commit();
+        }
+      }
+    }
+  }, [activeQualia, userQualia, addMessage]);
+
   const handleCall = async () => {
     if (isCalling) {
       console.log("Ending call.");
@@ -721,87 +810,41 @@ const AppContent = () => {
       console.log("Starting call.");
       addMessage("(Call started)", "ui");
       setIsCalling(true);
-      if (Platform.OS === 'web') {
-        // Fetch context
-        let systemInstruction = undefined;
-        if (activeQualia) {
-          try {
-            const qualiaDocRef = await getQualiaDocRef(activeQualia.id);
-            const qualiaDocSnap = await getDoc(qualiaDocRef);
-            const qualiaDoc = qualiaDocSnap.data() as QualiaDoc;
-            const pendingCommunications = await getPendingCommunications(activeQualia.id);
-            const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
-            systemInstruction = `You are a qualia. Here is your memory and context:\n${JSON.stringify({ myQualiaId: activeQualia.id, qualia: serializedQualia, money: 100 })}`;
-            console.log("System instruction prepared with context.");
-          } catch (e) {
-            console.error("Failed to fetch context for audio session:", e);
-          }
+
+      // Fetch context
+      let systemInstruction: string | undefined = undefined;
+      if (activeQualia) {
+        try {
+          const qualiaDocRef = await getQualiaDocRef(activeQualia.id);
+          const qualiaDocSnap = await getDoc(qualiaDocRef);
+          const qualiaDoc = qualiaDocSnap.data() as QualiaDoc;
+          const pendingCommunications = await getPendingCommunications(activeQualia.id);
+          const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
+          systemInstruction = `You are a qualia. Here is your memory and context:\n${JSON.stringify({ myQualiaId: activeQualia.id, qualia: serializedQualia, money: 100 })}`;
+          console.log("System instruction prepared with context.");
+        } catch (e) {
+          console.error("Failed to fetch context for audio session:", e);
         }
+      }
 
+      if (Platform.OS === 'web') {
         const session = await startAudioSession(
-          (type, text) => { // onTranscriptPart
-            const isContinuing = lastTranscriptType.current === type;
-            if (!isContinuing) {
-              currentStreamDeliveryTime.current = Timestamp.now();
-            }
-            addMessage(text, type === 'user' ? (userQualia?.id || 'user') : (activeQualia?.id || 'gemini'), {
-              appendToLast: isContinuing,
-              deliveryTime: currentStreamDeliveryTime.current || Timestamp.now()
-            });
-            lastTranscriptType.current = type;
-          },
-          async (type, text) => { // onTranscriptFlush
-            if (type === 'ended') {
-              setIsCalling(false);
-              setLiveSession(null);
-              addMessage("(Call ended)", "ui");
-              lastTranscriptType.current = null;
-              currentStreamDeliveryTime.current = null;
-            } else {
-              lastTranscriptType.current = null;
-              currentStreamDeliveryTime.current = null;
-
-              // Persist transcript
-              if (activeQualia && userQualia) {
-                const deliveryTime = Timestamp.now();
-                if (type === 'user') {
-                  const communication: Communication = {
-                    fromQualiaId: userQualia.id,
-                    fromQualiaName: userQualia.name,
-                    toQualiaId: activeQualia.id,
-                    toQualiaName: activeQualia.name,
-                    message: text,
-                    communicationType: "HUMAN_TO_QUALIA",
-                    ack: false,
-                    seen: true,
-                    deliveryTime: deliveryTime,
-                  };
-                  addDoc(await communicationsCollection(), communication);
-                } else if (type === 'gemini') {
-                  const communication: Communication = {
-                    fromQualiaId: activeQualia.id,
-                    fromQualiaName: activeQualia.name,
-                    toQualiaId: userQualia.id,
-                    toQualiaName: userQualia.name,
-                    message: text,
-                    communicationType: "QUALIA_TO_HUMAN",
-                    ack: false,
-                    seen: true,
-                    deliveryTime: deliveryTime
-                  };
-                  addDoc(await communicationsCollection(), communication);
-                }
-              }
-            }
-          },
+          onTranscriptPart,
+          onTranscriptFlush,
           systemInstruction
         );
         setLiveSession(session);
       } else {
-        webviewRef.current?.postMessage('start');
+        webviewRef.current?.postMessage(JSON.stringify({ type: 'start', systemInstruction }));
       }
     }
   };
+
+
+
+
+
+
   // Handles the creation flow logic
   const createAndSwitchToQualia = useCallback(
     (name: string) => {
@@ -899,7 +942,7 @@ const AppContent = () => {
                 { color: userQualia ? theme.text : theme.dimText },
               ]}
             >
-              {activeQualia ? activeQualia.name : "Loading..."}
+              {activeQualia ? activeQualia.name : "Intro"}
             </Text>
           </TouchableOpacity>
           {userQualia && (
@@ -1012,12 +1055,11 @@ const AppContent = () => {
           onMessage={(event) => {
             const data = JSON.parse(event.nativeEvent.data);
             if (data.type === 'user') {
-              addMessage(data.message, 'user');
+              onTranscriptFlush('user', data.message);
             } else if (data.type === 'gemini') {
-              addMessage(data.message, 'gemini');
+              onTranscriptFlush('gemini', data.message);
             } else if (data.type === 'ended') {
-              setIsCalling(false);
-              addMessage("(Call ended)", "ui");
+              onTranscriptFlush('ended', '');
             }
           }}
         />

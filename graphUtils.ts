@@ -165,10 +165,8 @@ export class BaseGraphCorruptionError extends Error {
 }
 
 export class GraphValidationError extends Error {
-    missingIds: string[];
-    constructor(missingIds: string[]) {
-        super(`Missing referred IDs under assumptions: ${missingIds.join(", ")}`);
-        this.missingIds = missingIds;
+    constructor(message: string, operations: IntegrationOperation[]) {
+        super(`Validation failed:\n\n${message}\n\n Attempted operations:\n\n${JSON.stringify(operations)}`);
         this.name = "GraphValidationError";
     }
 }
@@ -190,7 +188,7 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
 
     const newDoc = { ...doc, nodes: { ...doc.nodes } };
     const createdNodeIds = new Set<string>();
-    const missingIds = new Set<string>();
+    const errors: string[] = [];
 
     // Simple Base64 UUID generator (22 chars, ~132 bits of entropy)
     const generateId = () => {
@@ -205,16 +203,18 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
     for (const op of operations) {
         if (op.type === "CREATE") {
             if (!op.createId) {
-                throw new GraphValidationError([`CREATE operation missing createId`]);
+                errors.push(`CREATE operation missing createId`);
+                continue;
             }
             const id = op.createId;
 
             // Check for collision with existing nodes
             if (doc.nodes[id]) {
                 const existingNode = doc.nodes[id];
-                throw new GraphValidationError([
+                errors.push(
                     `CREATE operation failed: Conclusion with ID ${id} already exists. Existing conclusion content: ${existingNode.conclusion}`
-                ]);
+                );
+                continue;
             }
 
             // Assumptions are used directly as provided by LLM
@@ -222,7 +222,8 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
 
             // Validate conclusion is non-empty
             if (!op.conclusion || op.conclusion.trim() === "") {
-                throw new GraphValidationError([`CREATE operation with id ${id} has empty conclusion`]);
+                errors.push(`CREATE operation with id ${id} has empty conclusion`);
+                continue;
             }
 
             const newNode: QualiaNode = {
@@ -235,12 +236,13 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
             createdNodeIds.add(newNode.id);
         } else if (op.type === "DELETE") {
             if (!op.deleteIds || op.deleteIds.length === 0) {
-                throw new GraphValidationError([`DELETE operation missing deleteIds or empty`]);
+                errors.push(`DELETE operation missing deleteIds`);
+                continue;
             }
 
             for (const idToDelete of op.deleteIds) {
                 if (!newDoc.nodes[idToDelete]) {
-                    missingIds.add(idToDelete);
+                    errors.push(`DELETE operation refers to non-existent ID: ${idToDelete}`);
                     continue;
                 }
                 delete newDoc.nodes[idToDelete];
@@ -254,8 +256,9 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
         for (const assumptionId of node.assumptionIds) {
             if (!newDoc.nodes[assumptionId]) {
                 // This catches the case where we deleted an assumption but didn't delete the parent.
-                // We should probably throw a GraphValidationError here to tell LLM to delete the parent too.
-                throw new GraphValidationError([`Conclusion ${node.id} refers to missing assumption ${assumptionId}. If you removed ${assumptionId}, you must also removed ${node.id}.`]);
+                errors.push(
+                    `Conclusion ${node.id} refers to missing assumption ${assumptionId}. If you removed ${assumptionId}, you must also remove ${node.id}.`
+                );
             }
         }
     }
@@ -266,14 +269,15 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
         if (node) {
             for (const assumptionId of node.assumptionIds) {
                 if (!newDoc.nodes[assumptionId]) {
-                    missingIds.add(assumptionId);
+                    errors.push(`The ID ${assumptionId} used as an assumption for conclusion ${node.id} does not exist`);
                 }
             }
         }
     }
 
-    if (missingIds.size > 0) {
-        throw new GraphValidationError(Array.from(missingIds));
+    // Throw all collected errors together
+    if (errors.length > 0) {
+        throw new GraphValidationError(errors.join('\n'), operations);
     }
 
     return newDoc;

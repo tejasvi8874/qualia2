@@ -1,4 +1,5 @@
 import {
+  and,
   collection,
   CollectionReference,
   DocumentData,
@@ -6,6 +7,7 @@ import {
   getDoc,
   onSnapshot,
   query,
+  QueryCompositeFilterConstraint,
   QueryFieldFilterConstraint,
   runTransaction,
   Timestamp,
@@ -41,14 +43,16 @@ export async function qualiaDocsCollection() {
   return collection(db, "qualiaDocs");
 }
 
-export function getMessageListener(userId: string, collectionRef: CollectionReference<DocumentData, DocumentData>, communicationTypeFilter: QueryFieldFilterConstraint, callback: (communication: Communication) => Promise<void>, singleListener: boolean, processedField: string = "ack") {
-  console.log(`Registering message listener for userId: ${userId} and communicationTypeFilter: ${JSON.stringify(communicationTypeFilter)}`);
+export function getMessageListener(userId: string, collectionRef: CollectionReference<DocumentData, DocumentData>, echoFilter: QueryCompositeFilterConstraint, callback: (communication: Communication) => Promise<void>, singleListener: boolean, processedField: string = "ack") {
+  console.log(`Registering message listener for userId: ${userId} and communicationTypeFilter: ${JSON.stringify(echoFilter)}`);
   // Filters excludes docs where the field is not set.
   const q = query(
     collectionRef,
-    where("toQualiaId", "==", userId),
-    communicationTypeFilter,
-    where(processedField, "==", false)
+    and(
+      where("toQualiaId", "==", userId),
+      echoFilter,
+      where(processedField, "==", false)
+    )
   );
 
   return onSnapshot(q, async (snapshot) => {

@@ -48,21 +48,21 @@ function createDeferred<T>(): Deferred<T> {
 
 async function signIn(): Promise<User> {
     window.recaptchaVerifier = new RecaptchaVerifier(auth, 'sign-in-button', {
-      'size': 'invisible',
-      'callback': (response: any) => {
-        console.log("recaptcha", response);
-      }
+        'size': 'invisible',
+        'callback': (response: any) => {
+            console.log("recaptcha", response);
+        }
     });
     return signInWithPhoneNumber(auth, window.prompt("Enter phone number in format +COUNTRY_CODE_PHONE_NUMBER E.g. +1234567890:")!, window.recaptchaVerifier)
-      .then((confirmationResult) => confirmationResult.confirm(window.prompt("Enter verification code:")!).then((res) => {
-          console.log("res", res);
-          return res.user;
-      }))
-      .catch((error) => {
-        window.alert("Error during signInWithPhoneNumber: " + error.message);
-        console.error("Error during signInWithPhoneNumber", error);
-        throw error;
-      });
+        .then((confirmationResult) => confirmationResult.confirm(window.prompt("Enter verification code:")!).then((res) => {
+            console.log("res", res);
+            return res.user;
+        }))
+        .catch((error) => {
+            window.alert("Error during signInWithPhoneNumber: " + error.message);
+            console.error("Error during signInWithPhoneNumber", error);
+            throw error;
+        });
     // signInAnonymously(auth).then(async (x) => {
     //   console.log("signed in anonymously", x);
     //   await window.recaptchaVerifier.verify().then((x) => console.log("recaptcha verify", x));
