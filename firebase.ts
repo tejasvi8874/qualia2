@@ -15,15 +15,12 @@ import {
   where,
 } from "firebase/firestore";
 
-import { db, userPromise } from "./firebaseAuth";
+import { db, waitForUser } from "./firebaseAuth";
 import { Communication } from "./types";
 import { withRetry } from "./requestUtils";
 
 export async function getUserId() {
-  const user = await userPromise;
-  if (!user) {
-    throw new Error("User not authenticated");
-  }
+  const user = await waitForUser();
   return user.uid;
 }
 export async function communicationsCollection() {
@@ -134,4 +131,3 @@ function getTimeToWait(processingBefore: number) {
   const isValidProcessingBefore = waitTime > 0 && waitTime < MAX_PROCESSING_SECONDS * 1e3;
   return isValidProcessingBefore ? waitTime : 0;
 }
-

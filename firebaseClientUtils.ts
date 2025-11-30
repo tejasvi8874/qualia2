@@ -2,9 +2,6 @@ import { addDoc, query, where, getDocs, Timestamp, runTransaction, doc, orderBy,
 import { getUserId, communicationsCollection, contactsCollection, getMessageListener, qualiaCollection } from "./firebase";
 import { Communication, Contact, Contacts, ContextQualia, Qualia } from "./types";
 import { db } from "./firebaseAuth";
-import { updateContacts } from "./server";
-
-export { updateContacts };
 
 
 
