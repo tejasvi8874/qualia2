@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+export const audioHtml = `<!DOCTYPE html>
 <!-- Parallel mobile implementation in audioSession.ts -->
 <html>
 
@@ -12,12 +12,12 @@
         const log3 = (message) => post({ type: 'log', message });
 
         log3("HaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHaHa")
-        log3(`${{
+        log3(\`\${{
             w: window.AudioWorkletNode,
             AudioContext,
             navigator,
             md: navigator.mediaDevices
-        }}`)
+        }}\`)
     </script>
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/12.6.0/firebase-app.js";
@@ -53,11 +53,11 @@
             }
             try {
                 // Best-effort: reuse provided token. If it is not a custom token, this may fail; we still proceed.
-                log(`Signing in with provided token ${idToken}`);
+                log(\`Signing in with provided token \${idToken}\`);
                 const creds = await signInWithCustomToken(auth, idToken);
-                log(`Signed in with provided token: ${creds}`);
+                log(\`Signed in with provided token: \${creds}\`);
             } catch (error) {
-                log(`Sign-in with provided token failed: ${error?.message || error}`);
+                log(\`Sign-in with provided token failed: \${error?.message || error}\`);
                 post({ type: 'authError', message: error?.message || 'Failed to sign in' });
                 throw error;
             }
@@ -89,7 +89,7 @@
                     }
                 });
             } catch (error) {
-                log(`Failed to start audio session: ${error?.message || error}`);
+                log(\`Failed to start audio session: \${error?.message || error}\`);
                 post({ type: 'audioError', message: error?.message || 'Failed to start audio session' });
                 throw error;
             }
@@ -108,7 +108,7 @@
                 await startAudioConversation(liveSession);
             }
             catch (error) {
-                log(`Failed to start audio conversation: ${error?.message || error}`);
+                log(\`Failed to start audio conversation: \${error?.message || error}\`);
                 post({ type: 'audioError', message: error?.message || 'Failed to start audio conversation' });
                 throw error;
             }
@@ -187,7 +187,7 @@
                     }
                 }
             } catch (e) {
-                log(`Error processing message: ${e?.message || e}`);
+                log(\`Error processing message: \${e?.message || e}\`);
                 if (event.data === 'stop') {
                     if (liveSession) {
                         liveSession.close();
@@ -200,4 +200,4 @@
     </script>
 </body>
 
-</html>
+</html>`;

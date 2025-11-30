@@ -109,6 +109,7 @@ export interface QualiaDoc {
   nodes: Record<string, QualiaNode>;
   nextQualiaDocId: string;
   processingBefore?: Timestamp;
+  createdTime: Timestamp;
 }
 
 export const INTEGRATION_SCHEMA = Schema.object({
@@ -160,4 +161,20 @@ export interface ContextQualia {
   lastContactTime: Timestamp;
 }
 
+export interface FunctionResult {
+  value?: any;
+  error?: string;
+}
 
+import { FUNCTION_NAMES } from "./functions/src/shared";
+
+export type FunctionName = typeof FUNCTION_NAMES[keyof typeof FUNCTION_NAMES];
+
+export interface FunctionCall {
+  id?: string;
+  qualiaId: string;
+  functionName: FunctionName;
+  parameters: any;
+  result?: FunctionResult;
+  createTime?: Timestamp;
+}

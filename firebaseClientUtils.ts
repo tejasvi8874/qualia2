@@ -1,6 +1,7 @@
-import { addDoc, query, where, getDocs, Timestamp, runTransaction, doc, orderBy, limit, or } from "firebase/firestore";
-import { getUserId, communicationsCollection, contactsCollection, getMessageListener, qualiaCollection } from "./firebase";
-import { Communication, Contact, Contacts, ContextQualia, Qualia } from "./types";
+import { addDoc, query, where, getDocs, Timestamp, runTransaction, doc, orderBy, limit, or, onSnapshot, collection, deleteDoc } from "firebase/firestore";
+export { getUserId } from "./firebase";
+import { communicationsCollection, contactsCollection, getMessageListener, qualiaCollection, getUserId } from "./firebase";
+import { Communication, Contact, Contacts, ContextQualia, Qualia, FunctionCall, FunctionResult, FunctionName, FUNCTION_NAMES } from "./types";
 import { db } from "./firebaseAuth";
 
 
@@ -96,4 +97,37 @@ export async function getQualia(qualiaId: string): Promise<Qualia> {
     throw new Error(`Unique Qualia with id ${qualiaId} not found: ${docs}`);
   }
   return docs[0].data() as Qualia;
+}
+
+export async function callCloudFunction(functionName: FunctionName, parameters: any): Promise<any> {
+  const userId = await getUserId();
+  const functionCall: FunctionCall = {
+    qualiaId: userId,
+    functionName,
+    parameters,
+    createTime: Timestamp.now(),
+  };
+
+  const docRef = await addDoc(collection(db, "functionCalls"), functionCall);
+
+  return new Promise((resolve, reject) => {
+    const unsubscribe = onSnapshot(docRef, (doc) => {
+      const data = doc.data() as FunctionCall;
+      if (data?.result) {
+        unsubscribe();
+        if (data.result.error) {
+          reject(new Error(`Error processing function call ${functionName} with ${JSON.stringify(parameters)}. ID ${doc.id}:\n${data.result.error}`));
+        } else {
+          deleteDoc(docRef).catch(console.error);
+          resolve(data.result.value);
+        }
+      }
+    });
+
+    // Timeout after 10 minutes
+    setTimeout(() => {
+      unsubscribe();
+      reject(new Error("Function call timed out"));
+    }, 10 * 60 * 1000);
+  });
 }

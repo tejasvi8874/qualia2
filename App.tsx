@@ -20,17 +20,19 @@ import {
 // Import SafeAreaProvider to use in the root and within the Modal
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
-import { sendMessage, registerClientMessageClb, getContacts, getHistoricalMessages } from "./firebaseClientUtils";
+import { getUserId, registerClientMessageClb, sendMessage, getContacts, getHistoricalMessages, getQualia, callCloudFunction } from './firebaseClientUtils';
 import { Communication, ContextQualia, QualiaDoc } from "./types";
 import { Timestamp, getDoc, addDoc, writeBatch, doc } from "firebase/firestore";
 import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef, updateContacts } from "./server";
 import { serializeQualia } from "./graphUtils";
 import { auth, db } from "./firebaseAuth";
 import { communicationsCollection } from "./firebase";
-import { RecaptchaVerifier, signInWithPhoneNumber, ConfirmationResult, PhoneAuthProvider, signInWithCredential } from "firebase/auth";
+import { RecaptchaVerifier, signInWithPhoneNumber, ConfirmationResult, PhoneAuthProvider, signInWithCredential, signInWithCustomToken } from "firebase/auth";
 import { firebaseConfig } from "./firebaseConfig";
 import { startAudioSession } from "./audioSession";
 import { LiveSession } from "firebase/ai";
+import { FUNCTION_NAMES } from "./functions/src/shared";
+import { audioHtml } from './public/webview/audioHtml';
 
 declare global {
   interface Window {
@@ -361,6 +363,8 @@ const AppContent = () => {
   const authWebViewRef = useRef<WebView>(null);
   const authWebViewReady = useRef(false);
   const pendingAuthCommand = useRef<string | null>(null);
+  const audioWebViewReady = useRef(false);
+  const pendingAudioCommand = useRef<string | null>(null);
   const [liveSession, setLiveSession] = useState<LiveSession | null>(null);
   const [graphError, setGraphError] = useState<string | null>(null);
   const [confirmationResult, setConfirmationResult] = useState<ConfirmationResult | null>(null);
@@ -374,7 +378,7 @@ const AppContent = () => {
       return true;
     }
     pendingAuthCommand.current = message;
-    setGraphError("Auth component is still loading. Retrying...");
+    console.log("Auth component is still loading. Retrying...");
     return false;
   }, []);
 
@@ -887,10 +891,17 @@ const AppContent = () => {
       if (Platform.OS === 'web') {
         if (liveSession) {
           liveSession.close();
+          setLiveSession(null);
         }
       } else {
-        webviewRef.current?.postMessage('stop');
+        const stopMsg = JSON.stringify({ type: 'stop' });
+        if (audioWebViewReady.current && webviewRef.current) {
+          webviewRef.current.postMessage(stopMsg);
+        } else {
+          pendingAudioCommand.current = stopMsg;
+        }
       }
+      setIsCalling(false);
     } else {
       console.log("Starting call.");
       addMessage("(Call started)", "ui");
@@ -920,7 +931,28 @@ const AppContent = () => {
         );
         setLiveSession(session);
       } else {
-        webviewRef.current?.postMessage(JSON.stringify({ type: 'start', systemInstruction }));
+        // Native path: delegate to WebView (WebSockets available there)
+        const user = auth.currentUser;
+        if (!user) {
+          console.log("Not authenticated; cannot start call.");
+          setIsCalling(false);
+          return;
+        }
+        let idToken = "temp";
+        console.log("starting audio session")
+        try {
+          idToken = await callCloudFunction(FUNCTION_NAMES.GET_CUSTOM_TOKEN, {});
+          console.log("Got custom token:", idToken);
+        } catch (e) {
+          console.error("Error getting custom token:", e);
+        }
+        console.log("Loggin in with token ", idToken)
+        const startMsg = JSON.stringify({ type: 'start', systemInstruction, idToken });
+        if (audioWebViewReady.current && webviewRef.current) {
+          webviewRef.current.postMessage(startMsg);
+        } else {
+          pendingAudioCommand.current = startMsg;
+        }
       }
     }
   };
@@ -1148,79 +1180,114 @@ const AppContent = () => {
             </TouchableOpacity>
           )}
         </View>
-      </KeyboardAvoidingView>
 
-      <QualiaSwitcher
-        visible={isSwitcherVisible}
-        onClose={() => setIsSwitcherVisible(false)}
-        contacts={contacts}
-        userQualia={userQualia}
-        onAction={handleSwitcherAction}
-        theme={theme}
-        onSignOut={handleSignOut}
-      />
-      <View nativeID="sign-in-button" />
-      {Platform.OS !== 'web' && (
-        <WebView
-          ref={authWebViewRef}
-          style={{ position: 'absolute', width: 1, height: 1, opacity: 0, top: 0, left: 0 }}
-          source={require('./public/webview/auth.html')}
-          injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
-          onMessage={(event) => {
-            try {
-              const raw = event.nativeEvent.data;
-              const data = typeof raw === "string"
-                ? (() => { try { return JSON.parse(raw); } catch { return { type: "raw", message: raw }; } })()
-                : raw;
-              if (data.type === 'verificationId') {
-                setVerificationId(data.verificationId || null);
-                setGraphError(null);
-              } else if (data.type === 'authError') {
-                setGraphError(`Auth Error: ${data.message || 'Unknown error'}`);
-              } else if (data.type === 'log') {
-                console.log("Auth WebView:", data.message);
-              } else if (data.type === 'raw') {
-                console.log("Auth WebView raw:", data.message);
-              } else if (data.type === 'ready') {
+        <QualiaSwitcher
+          visible={isSwitcherVisible}
+          onClose={() => setIsSwitcherVisible(false)}
+          contacts={contacts}
+          userQualia={userQualia}
+          onAction={handleSwitcherAction}
+          theme={theme}
+          onSignOut={handleSignOut}
+        />
+        <View nativeID="sign-in-button" />
+        {Platform.OS !== 'web' && !userQualia && (
+          <View
+            style={{
+              width: '100%', height: 100,
+              position: 'absolute', top: 0, left: 0,
+              borderColor: 'red',
+              borderWidth: 10,
+              // opacity: 0.1,
+            }}
+          >
+            <WebView
+              ref={authWebViewRef}
+              source={require('./public/webview/auth.html')}
+              injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
+              onMessage={(event) => {
+                console.log("Auth WebView message received", event.nativeEvent.data.slice(0, 100));
+                try {
+                  const raw = event.nativeEvent.data;
+                  const data = typeof raw === "string"
+                    ? (() => { try { return JSON.parse(raw); } catch { return { type: "raw", message: raw }; } })()
+                    : raw;
+                  if (data.type === 'verificationId') {
+                    setVerificationId(data.verificationId || null);
+                  } else if (data.type === 'authError') {
+                    console.log(`Auth Error: ${data.message || 'Unknown error'}`);
+                  } else if (data.type === 'log') {
+                    console.log("Auth WebView:", data.message);
+                  } else if (data.type === 'raw') {
+                    console.log("Auth WebView raw:", data.message);
+                  } else if (data.type === 'ready') {
+                    authWebViewReady.current = true;
+                    if (pendingAuthCommand.current && authWebViewRef.current) {
+                      authWebViewRef.current.postMessage(pendingAuthCommand.current);
+                      pendingAuthCommand.current = null;
+                    }
+                  }
+                } catch (e) {
+                  console.error("Auth WebView parse error", e);
+                }
+              }}
+              onLoad={() => {
                 authWebViewReady.current = true;
-                setGraphError(null);
                 if (pendingAuthCommand.current && authWebViewRef.current) {
                   authWebViewRef.current.postMessage(pendingAuthCommand.current);
                   pendingAuthCommand.current = null;
                 }
+              }}
+              originWhitelist={["*"]}
+            />
+          </View>)}
+        {Platform.OS !== 'web' && userQualia && (
+          <WebView
+            ref={webviewRef}
+            style={{ position: 'absolute', width: 100, height: 100, borderWidth: 10, borderColor: 'red', opacity: 100, top: 0, left: 0 }}
+            source={{ html: audioHtml, baseUrl: 'https://localhost' }}
+            injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
+            onMessage={(event) => {
+              const raw = event.nativeEvent.data;
+              let data: any;
+              try {
+                data = typeof raw === "string" ? JSON.parse(raw) : raw;
+              } catch (err) {
+                console.warn("Audio WebView message parse failed", err, raw);
+                return;
               }
-            } catch (e) {
-              console.error("Auth WebView parse error", e);
-            }
-          }}
-          onLoad={() => {
-            authWebViewReady.current = true;
-            if (pendingAuthCommand.current && authWebViewRef.current) {
-              authWebViewRef.current.postMessage(pendingAuthCommand.current);
-              pendingAuthCommand.current = null;
-            }
-          }}
-          originWhitelist={["*"]}
-        />
-      )}
-      {Platform.OS !== 'web' && userQualia && (
-        <WebView
-          ref={webviewRef}
-          style={{ position: 'absolute', width: 1, height: 1, opacity: 0, top: 0, left: 0 }}
-          source={require('./public/webview/audio.html')}
-          injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
-          onMessage={(event) => {
-            const data = JSON.parse(event.nativeEvent.data);
-            if (data.type === 'user') {
-              onTranscriptFlush('user', data.message);
-            } else if (data.type === 'gemini') {
-              onTranscriptFlush('gemini', data.message);
-            } else if (data.type === 'ended') {
-              onTranscriptFlush('ended', '');
-            }
-          }}
-        />
-      )}
+              if (data.type === 'user') {
+                onTranscriptFlush('user', data.message);
+              } else if (data.type === 'gemini') {
+                onTranscriptFlush('gemini', data.message);
+              } else if (data.type === 'ended') {
+                onTranscriptFlush('ended', '');
+                setIsCalling(false);
+              } else if (data.type === 'log') {
+                console.log("Audio WebView:", data.message);
+              } else if (data.type === 'ready') {
+                audioWebViewReady.current = true;
+                if (pendingAudioCommand.current && webviewRef.current) {
+                  webviewRef.current.postMessage(pendingAudioCommand.current);
+                  pendingAudioCommand.current = null;
+                }
+              } else if (data.type === 'authError') {
+                console.log(`Audio Auth Error: ${data.message || 'Unknown error'}`);
+              }
+            }}
+            onLoad={() => {
+              audioWebViewReady.current = true;
+              if (pendingAudioCommand.current && webviewRef.current) {
+                webviewRef.current.postMessage(pendingAudioCommand.current);
+                pendingAudioCommand.current = null;
+              }
+            }}
+            allowsInlineMediaPlayback={true}
+            mediaPlaybackRequiresUserAction={false}
+            originWhitelist={["*"]}
+          />
+        )}
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 };

@@ -1,3 +1,8 @@
+/*
+  Util file for manual operations.
+*/
+
+
 const { initializeApp } = require('firebase-admin/app');
 const { getFirestore, Timestamp } = require('firebase-admin/firestore');
 const fs = require('fs');
@@ -663,4 +668,310 @@ async function processMigrationInBatches() {
 // createSystemCommunications(messages)
 // addMigratedFieldToAllCommunications()
 // printCommunicationsWithoutDeliveryTime()
-processMigrationInBatches();
+// processMigrationInBatches();
+// listQualiaDocs();
+// listQualiaDocs();
+// deleteNewQualiaDocs("2025-11-29T23:00:14.088Z", true);
+// populateCreatedTime(true);
+// diffQualiaDocs('test1', 'test2');
+
+/**
+ * Lists qualia docs for a specific qualiaId sorted by creation time (descending).
+ * 
+ * @param {string} qualiaId - The qualia ID to list docs for (default: '1MM1DDZnDmXnn0GBB4oBGoRqKaD2')
+ */
+const readline = require('readline');
+
+/**
+ * Calculates the difference between two sets of nodes.
+ * 
+ * @param {Object} nodes1 - The older set of nodes
+ * @param {Object} nodes2 - The newer set of nodes
+ * @returns {Object} Diff results containing added, removed, and modified IDs
+ */
+function calculateNodeDiff(nodes1 = {}, nodes2 = {}) {
+  const ids1 = new Set(Object.keys(nodes1));
+  const ids2 = new Set(Object.keys(nodes2));
+
+  const addedIds = [...ids2].filter(id => !ids1.has(id));
+  const removedIds = [...ids1].filter(id => !ids2.has(id));
+  const commonIds = [...ids1].filter(id => ids2.has(id));
+
+  const modifiedIds = commonIds.filter(id => {
+    const n1 = nodes1[id];
+    const n2 = nodes2[id];
+    return JSON.stringify(n1) !== JSON.stringify(n2);
+  });
+
+  return { addedIds, removedIds, modifiedIds };
+}
+
+/**
+ * Lists qualia docs for a specific qualiaId sorted by creation time (descending).
+ * Shows diff summary vs previous doc and supports pagination.
+ * 
+ * @param {string} qualiaId - The qualia ID to list docs for (default: '1MM1DDZnDmXnn0GBB4oBGoRqKaD2')
+ */
+async function listQualiaDocs(qualiaId = '1MM1DDZnDmXnn0GBB4oBGoRqKaD2') {
+  try {
+    console.log(`Listing qualia docs for ${qualiaId}...`);
+
+    const qualiaDocsRef = db.collection('qualiaDocs');
+    const snapshot = await qualiaDocsRef.where('qualiaId', '==', qualiaId).get();
+
+    if (snapshot.empty) {
+      console.log('No qualia docs found.');
+      return;
+    }
+
+    const docs = snapshot.docs.map(doc => ({
+      id: doc.id,
+      createTime: doc.createTime.toDate(),
+      data: doc.data()
+    }));
+
+    // Sort by createTime descending
+    docs.sort((a, b) => b.createTime - a.createTime);
+
+    console.log(`Found ${docs.length} docs.\n`);
+
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    const askQuestion = (query) => new Promise(resolve => rl.question(query, resolve));
+
+    const PAGE_SIZE = 20;
+    for (let i = 0; i < docs.length; i++) {
+      if (i > 0 && i % PAGE_SIZE === 0) {
+        const answer = await askQuestion(`\n--- Showing ${i} of ${docs.length}. Press Enter to see more, or 'q' to quit: `);
+        if (answer.toLowerCase() === 'q') {
+          break;
+        }
+        console.log('\n');
+      }
+
+      const doc = docs[i];
+      const nodeCount = doc.data.nodes ? Object.keys(doc.data.nodes).length : 0;
+
+      let diffSummary = '';
+      // Compare with the next doc (which is older because we sorted descending)
+      if (i + 1 < docs.length) {
+        const olderDoc = docs[i + 1];
+        const diff = calculateNodeDiff(olderDoc.data.nodes, doc.data.nodes);
+        diffSummary = `Diff vs older: +${diff.addedIds.length} -${diff.removedIds.length} *${diff.modifiedIds.length}`;
+      } else {
+        diffSummary = 'Oldest fetched doc';
+      }
+
+      console.log(`[${i + 1}] ID: ${doc.id}`);
+      console.log(`    Created: ${doc.createTime.toISOString()}`);
+      console.log(`    Nodes: ${nodeCount}`);
+      console.log(`    ${diffSummary}`);
+      console.log(`    NextQualiaDocId: ${doc.data.nextQualiaDocId || 'None (Latest)'}`);
+      console.log('-----------------------------------');
+    }
+
+    rl.close();
+
+  } catch (error) {
+    console.error('Error listing qualia docs:', error);
+  }
+}
+
+/**
+ * Diffs two qualia docs by comparing their nodes.
+ * 
+ * @param {string} docId1 - The ID of the older document
+ * @param {string} docId2 - The ID of the newer document
+ */
+async function diffQualiaDocs(docId1, docId2) {
+  try {
+    console.log(`Diffing qualia docs ${docId1} vs ${docId2}...`);
+
+    const docRef1 = db.collection('qualiaDocs').doc(docId1);
+    const docRef2 = db.collection('qualiaDocs').doc(docId2);
+
+    const [doc1, doc2] = await Promise.all([docRef1.get(), docRef2.get()]);
+
+    if (!doc1.exists) {
+      console.error(`Document ${docId1} does not exist.`);
+      return;
+    }
+    if (!doc2.exists) {
+      console.error(`Document ${docId2} does not exist.`);
+      return;
+    }
+
+    const diff = calculateNodeDiff(doc1.data().nodes, doc2.data().nodes);
+
+    console.log(`\nDiff Results:`);
+    console.log(`  Added Nodes: ${diff.addedIds.length}`);
+    console.log(`  Removed Nodes: ${diff.removedIds.length}`);
+    console.log(`  Modified Nodes: ${diff.modifiedIds.length}`);
+
+    if (diff.addedIds.length > 0) {
+      console.log('\n  [Added IDs]:', diff.addedIds.join(', '));
+    }
+    if (diff.removedIds.length > 0) {
+      console.log('\n  [Removed IDs]:', diff.removedIds.join(', '));
+    }
+    if (diff.modifiedIds.length > 0) {
+      console.log('\n  [Modified IDs]:', diff.modifiedIds.join(', '));
+    }
+
+  } catch (error) {
+    console.error('Error diffing qualia docs:', error);
+  }
+}
+
+
+
+
+
+/**
+ * Deletes qualia docs newer than a specific date.
+ * 
+ * @param {string} isoDateString - The cutoff date in ISO format (e.g., "2025-11-29T23:00:14.088Z")
+ * @param {boolean} dryRun - If true, only lists docs to be deleted without deleting them (default: true)
+ * @param {string} qualiaId - The qualia ID to filter by (default: '1MM1DDZnDmXnn0GBB4oBGoRqKaD2')
+ */
+async function deleteNewQualiaDocs(isoDateString, dryRun = true, qualiaId = '1MM1DDZnDmXnn0GBB4oBGoRqKaD2') {
+  try {
+    const cutoffDate = new Date(isoDateString);
+    if (isNaN(cutoffDate.getTime())) {
+      console.error('Invalid date string provided.');
+      return;
+    }
+
+    console.log(`${dryRun ? '[DRY RUN] ' : ''}Finding qualia docs newer than ${cutoffDate.toISOString()} for ${qualiaId}...`);
+
+    const qualiaDocsRef = db.collection('qualiaDocs');
+    // Note: We can't filter by createTime in the query directly easily without an index on a custom field, 
+    // so we'll fetch and filter client-side. Assuming the number of docs isn't massive (419 is fine).
+    const snapshot = await qualiaDocsRef.where('qualiaId', '==', qualiaId).get();
+
+    if (snapshot.empty) {
+      console.log('No qualia docs found.');
+      return;
+    }
+
+    const docsToDelete = snapshot.docs.filter(doc => doc.createTime.toDate() > cutoffDate);
+
+    console.log(`Found ${docsToDelete.length} docs to delete out of ${snapshot.size} total.`);
+
+    if (docsToDelete.length === 0) {
+      return;
+    }
+
+    if (dryRun) {
+      console.log('\nDocs that would be deleted:');
+      docsToDelete.forEach(doc => {
+        console.log(`  ID: ${doc.id}, Created: ${doc.createTime.toDate().toISOString()}`);
+      });
+      console.log('\nTo actually delete, call with dryRun = false.');
+      return;
+    }
+
+    // Perform deletion in batches
+    const batchSize = 500;
+    let deletedCount = 0;
+
+    for (let i = 0; i < docsToDelete.length; i += batchSize) {
+      const batch = db.batch();
+      const chunk = docsToDelete.slice(i, i + batchSize);
+
+      chunk.forEach(doc => {
+        batch.delete(doc.ref);
+      });
+
+      await batch.commit();
+      deletedCount += chunk.length;
+      console.log(`Deleted batch of ${chunk.length} docs. Total deleted: ${deletedCount}`);
+    }
+
+    console.log('Deletion complete.');
+
+  } catch (error) {
+    console.error('Error deleting qualia docs:', error);
+  }
+}
+
+/**
+ * Populates the 'createdTime' field for qualia docs that are missing it.
+ * Uses the document's system creation time.
+ * 
+ * @param {boolean} dryRun - If true, only lists docs to be updated without updating them (default: true)
+ */
+async function populateCreatedTime(dryRun = true) {
+  try {
+    console.log(`${dryRun ? '[DRY RUN] ' : ''}Populating createdTime for qualia docs...`);
+
+    const qualiaDocsRef = db.collection('qualiaDocs');
+    const snapshot = await qualiaDocsRef.get();
+
+    if (snapshot.empty) {
+      console.log('No qualia docs found.');
+      return;
+    }
+
+    const docsToUpdate = [];
+    snapshot.docs.forEach(doc => {
+      const data = doc.data();
+      if (!data.createdTime) {
+        docsToUpdate.push({
+          ref: doc.ref,
+          id: doc.id,
+          createTime: doc.createTime
+        });
+      }
+    });
+
+    console.log(`Found ${docsToUpdate.length} docs missing createdTime out of ${snapshot.size} total.`);
+
+    if (docsToUpdate.length === 0) {
+      return;
+    }
+
+    if (dryRun) {
+      console.log('\nDocs that would be updated:');
+      // Show first 10 as sample
+      docsToUpdate.slice(0, 10).forEach(doc => {
+        console.log(`  ID: ${doc.id}, Will set createdTime to: ${doc.createTime.toDate().toISOString()}`);
+      });
+      if (docsToUpdate.length > 10) {
+        console.log(`  ... and ${docsToUpdate.length - 10} more.`);
+      }
+      console.log('\nTo actually update, call with dryRun = false.');
+      return;
+    }
+
+    // Perform updates in batches
+    const batchSize = 500;
+    let updatedCount = 0;
+
+    for (let i = 0; i < docsToUpdate.length; i += batchSize) {
+      const batch = db.batch();
+      const chunk = docsToUpdate.slice(i, i + batchSize);
+
+      chunk.forEach(doc => {
+        batch.update(doc.ref, { createdTime: doc.createTime });
+      });
+
+      await batch.commit();
+      updatedCount += chunk.length;
+      console.log(`Updated batch of ${chunk.length} docs. Total updated: ${updatedCount}`);
+    }
+
+    console.log('Population complete.');
+
+  } catch (error) {
+    console.error('Error populating createdTime:', error);
+  }
+}
+
+// Example usage:
+// deleteNewQualiaDocs("2025-11-29T23:00:13.088Z", true);
+// Example usage:
+// populateCreatedTime(false);

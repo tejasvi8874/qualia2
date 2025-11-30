@@ -9,8 +9,12 @@
     /* Keep the reCAPTCHA container off-screen while still present in the DOM */
     #recaptcha-container {
       position: absolute;
-      /* top: -9999px;
-      left: -9999px; */
+      top: 0;
+      left: 0;
+      width: 1px;
+      height: 1px;
+      opacity: 0.01; /* tiny but present so invisible challenge can render when required */
+      z-index: 9999;
     }
   </style>
 </head>
@@ -22,20 +26,29 @@
     // firebaseConfig is injected by the React Native wrapper.
     const post = (payload) => window.ReactNativeWebView.postMessage(JSON.stringify(payload));
     const log = (message) => post({ type: 'log', message });
+    // Early ping so host knows the WebView booted, even if init fails.
+    post({ type: 'ready' });
+    log('Auth WebView script loaded');
 
     let appInitialized = false;
     const ensureApp = () => {
       if (appInitialized) return;
-      firebase.initializeApp(firebaseConfig);
-      appInitialized = true;
-      log('Auth WebView initialized');
-      post({ type: 'ready' });
+      try {
+        firebase.initializeApp(firebaseConfig);
+        appInitialized = true;
+        log('Auth WebView initialized');
+        post({ type: 'ready' });
+      } catch (err) {
+        post({ type: 'authError', message: err?.message || 'Auth init failed' });
+      }
     };
 
     const getVerifier = () => {
       if (!window.recaptchaVerifier) {
         window.recaptchaVerifier = new firebase.auth.RecaptchaVerifier('recaptcha-container', {
           size: 'invisible',
+          'callback': (token) => log(`reCAPTCHA completed: ${token ? 'token received' : 'no token'}`),
+          'expired-callback': () => log('reCAPTCHA expired; resetting'),
         });
       }
       return window.recaptchaVerifier;
@@ -45,7 +58,14 @@
       try {
         ensureApp();
         const verifier = getVerifier();
-        post ({ type: 'log', message: `Starting phone auth for ${phoneNumber}` });
+        post({ type: 'log', message: `Starting phone auth for ${phoneNumber}` });
+        // Trigger the invisible challenge if required
+        try {
+          await verifier.verify();
+        } catch (verifyErr) {
+          post({ type: 'log', message: `reCAPTCHA verify failed: ${verifyErr?.message || verifyErr}` });
+          throw verifyErr;
+        }
         const confirmationResult = await firebase.auth().signInWithPhoneNumber(phoneNumber, verifier);
         post({ type: 'log', message: `Sent verification code to ${phoneNumber}. Got result ${confirmationResult}` });
         post({ type: 'verificationId', verificationId: confirmationResult.verificationId });
