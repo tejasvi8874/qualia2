@@ -43,6 +43,10 @@ export interface Communication {
   isoDeliveryTime?: string;
 }
 
+import { FUNCTION_NAMES } from "./functions/src/shared";
+
+
+
 export const COMMUNICATION_SCHEMA = Schema.object({
   properties: {
     reasoning: Schema.string(),
@@ -91,6 +95,22 @@ export const COMMUNICATION_SCHEMA = Schema.object({
   propertyOrdering: ["reasoning", "communications"],
   optionalProperties: ["reasoning", "communications"],
 });
+
+export type FunctionName = typeof FUNCTION_NAMES[keyof typeof FUNCTION_NAMES];
+
+export interface FunctionResult {
+  value?: any;
+  error?: string;
+}
+
+export interface FunctionCall {
+  id?: string;
+  qualiaId: string;
+  functionName: FunctionName;
+  parameters: any;
+  result?: FunctionResult;
+  createTime?: Timestamp;
+}
 
 export interface Communications {
   reasoning?: string;

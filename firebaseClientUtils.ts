@@ -1,7 +1,6 @@
 import { addDoc, query, where, getDocs, Timestamp, runTransaction, doc, orderBy, limit, or, onSnapshot, collection, deleteDoc } from "firebase/firestore";
-export { getUserId } from "./firebase";
-import { communicationsCollection, contactsCollection, getMessageListener, qualiaCollection, getUserId } from "./firebase";
-import { Communication, Contact, Contacts, ContextQualia, Qualia, FunctionCall, FunctionResult, FunctionName, FUNCTION_NAMES } from "./types";
+import { getUserId, communicationsCollection, contactsCollection, getMessageListener, qualiaCollection } from "./firebase";
+import { Communication, Contact, Contacts, ContextQualia, Qualia, FunctionCall, FunctionName } from "./types";
 import { db } from "./firebaseAuth";
 
 
@@ -98,7 +97,6 @@ export async function getQualia(qualiaId: string): Promise<Qualia> {
   }
   return docs[0].data() as Qualia;
 }
-
 export async function callCloudFunction(functionName: FunctionName, parameters: any): Promise<any> {
   const userId = await getUserId();
   const functionCall: FunctionCall = {
