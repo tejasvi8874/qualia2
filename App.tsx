@@ -19,24 +19,27 @@ import {
 } from "react-native";
 // Import SafeAreaProvider to use in the root and within the Modal
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
-import { registerCallback, sendMessage } from "./firebase";
+import { sendMessage, registerClientMessageClb } from "./firebaseClientUtils";
+import { Communications, Communication, ContextQualia } from "./types";
+import { serverTimestamp, Timestamp } from "firebase/firestore";
+import { getUserId } from "./firebase";
+import { messageListener } from "./server";
+import { auth } from "./firebaseAuth";
+import { signInAnonymously } from "firebase/auth";
 
-// --- Configuration & Constants ---
-enum SelfCommunicationType {
-  HUMAN_TO_QUALIA,
-  QUALIA_TO_HUMAN,
-  QUALIA_TO_QUALIA,
-}
-interface CommunicationT {
-  reasoning: string;
-  fromQualiaId: string;
-  toQualiaId: string;
-  isNewQualia: boolean;
-  money: number;
-  message: string;
-  selfCommunicationType: SelfCommunicationType;
-  delay: number;
-}
+/*
+TODO: optimize get contacts to fetch conversation after the last contact timestamp
+TODO: Slow and fast model. Slow model does max thinking.
+TODO: Ask to provide shorter responses.
+TODO: Fix startup screen. Open up to last/self. Maybe do away with separate onboarding qualia.
+TODO: Test speaking/thinking
+TODO: Publish website
+TODO: Default value of thinking budget? Seems to be -1. Set it to that to be safe.
+TODO: Trigger contact sharing when mentioned? Language etc issue. Maybe display an icon to "connect" which can lure users to click and share to remove visual annoyance.
+TODO: Suggestion to be cognizant of rate and last timstamp of human responses to detect if your messages are being viewed by a human.
+TODO: Clicking an ID triggers a message to that qualia by own qualia using best deducible name
+TODO: Encryption? With warning of data loss if key is lost.
+*/
 
 const IDLE_TIMEOUT = 1500; // 1.5 seconds of inactivity to send remaining input and clear
 
@@ -61,7 +64,27 @@ const FONT_FAMILY = Platform.select({
 
 const FONT_SIZE = 18;
 
-const getTheme = (colorScheme) => {
+type LocalColorScheme = "light" | "dark" | "no-preference" | null | undefined;
+
+interface Theme {
+  isDark: boolean;
+  background: string;
+  text: string;
+  dimText: string;
+  accent: string;
+  createAccent: string;
+}
+
+interface Message {
+  id: string;
+  text: string;
+  type?: string;
+  isThought?: boolean;
+  contextId?: string;
+  contextName?: string;
+}
+
+const getTheme = (colorScheme: LocalColorScheme): Theme => {
   const isDark = colorScheme === "dark";
   return {
     isDark,
@@ -77,17 +100,33 @@ const getTheme = (colorScheme) => {
 const ONBOARDING_QUALIA = {
   id: "q-onboarding",
   name: "Onboarding",
-  frecency: 1,
 };
 const INITIAL_CONTACTS = [
-  { id: "q-friend-1", name: "Morgan", frecency: 10 },
-  { id: "q-base", name: "Base Qualia", frecency: 5 },
+  { id: "q-friend-1", name: "Morgan" },
+  { id: "q-base", name: "Base Qualia" },
   ONBOARDING_QUALIA, // Keep Onboarding available
 ];
 
 // --- Components ---
 
-const MessageItem = React.memo(({ item, theme, isTalkingToSelf }) => {
+interface MessageItemProps {
+  item: {
+    id: string;
+    text: string;
+    type?: string;
+    isThought?: boolean;
+    contextId?: string;
+    contextName?: string;
+  };
+  theme: Theme;
+  isTalkingToSelf: boolean;
+}
+
+const MessageItem = React.memo(function MessageItem({
+  item,
+  theme,
+  isTalkingToSelf,
+}: MessageItemProps) {
   // Hooks must be called unconditionally at the top level.
 
   // Handle potential undefined isThought property (e.g., for delimiters) safely.
@@ -138,7 +177,17 @@ const MessageItem = React.memo(({ item, theme, isTalkingToSelf }) => {
   );
 });
 
-// Uses a unified 'onAction' prop to handle switching and creation
+interface QualiaSwitcherProps {
+  visible: boolean;
+  onClose: () => void;
+  contacts: ContextQualia[];
+  userQualia: ContextQualia | null;
+  onAction: (
+    action: { type: "SWITCH"; qualia: ContextQualia } | { type: "CREATE"; name: string },
+  ) => void;
+  theme: Theme;
+}
+
 const QualiaSwitcher = ({
   visible,
   onClose,
@@ -146,9 +195,9 @@ const QualiaSwitcher = ({
   userQualia,
   onAction,
   theme,
-}) => {
+}: QualiaSwitcherProps) => {
   const [searchQuery, setSearchQuery] = useState("");
-  const inputRef = useRef(null);
+  const inputRef = useRef<TextInput>(null);
 
   useEffect(() => {
     if (visible) {
@@ -161,11 +210,10 @@ const QualiaSwitcher = ({
     return contacts
       .filter((contact) =>
         contact.name.toLowerCase().includes(searchQuery.toLowerCase()),
-      )
-      .sort((a, b) => (b.frecency || 0) - (a.frecency || 0));
+      );
   }, [searchQuery, contacts]);
 
-  const handleSelect = (qualia) => {
+  const handleSelect = (qualia: ContextQualia) => {
     // Signal switching action
     onAction({ type: "SWITCH", qualia });
     onClose();
@@ -247,6 +295,7 @@ const QualiaSwitcher = ({
             data={filteredContacts}
             keyExtractor={(item) => item.id}
             keyboardShouldPersistTaps="always"
+            scrollEventThrottle={16}
             renderItem={({ item }) => (
               <TouchableOpacity
                 onPress={() => handleSelect(item)}
@@ -270,39 +319,66 @@ const AppContent = () => {
   const colorScheme = useColorScheme();
   const theme = useMemo(() => getTheme(colorScheme), [colorScheme]);
 
+  useEffect(() => {
+    signInAnonymously(auth).then((x) => console.log("signed", x));
+  }, []);
+
   // State
-  const [userQualia, setUserQualia] = useState(null);
+  const [userQualia, setUserQualia] = useState<ContextQualia | null>(null);
+  // user id and user name
+  const [userName, setUserName] = useState<string| null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
+
+  useEffect(() => {
+    getUserId().then(setUserId);
+  }, []);
   const [contacts, setContacts] = useState(INITIAL_CONTACTS);
   const [activeQualia, setActiveQualia] = useState(ONBOARDING_QUALIA);
 
+
   const [isThinkingMode, setIsThinkingMode] = useState(false); // False = Speaking
 
-  const [messages, setMessages] = useState([]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState("");
   const [isSwitcherVisible, setIsSwitcherVisible] = useState(false);
 
   // Derived State for UI presentation
   const isTalkingToSelf = useMemo(() => {
-    return userQualia && activeQualia.id === userQualia.id;
+    return userQualia ? activeQualia.id === userQualia.id : false;
   }, [userQualia, activeQualia]);
 
   // Refs
-  const inputRef = useRef(null);
-  const timerRef = useRef(null);
+  const inputRef = useRef<TextInput>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSentIndexRef = useRef(0);
-  const flatListRef = useRef(null);
+  // Allow null in the ref type so we can safely check before calling instance methods
+  const flatListRef = useRef<FlatList<any> | null>(null);
+
+  useEffect(() => {
+    console.log("Setting up message listener");
+    if (userId) {
+      const unsubscribe = messageListener();
+      return () => {
+        unsubscribe.then((unsub) => unsub()).then(() => console.log("Unsubscribed message listener"));
+      };
+    }
+  }, [userId]);
 
   // --- Message Management ---
-
   // Adds a message to the history, ensuring the context (activeQualia at the time) is stored.
-  const addMessage = useCallback((text, isThought) => {
-    const newMessage = {
-      id: Date.now().toString() + Math.random(),
-      text,
-      isThought,
-    };
-    setMessages((prevMessages) => [...prevMessages, newMessage]);
-  }, []);
+  const addMessage = useCallback(
+    (text: string, isThought: boolean) => {
+      const newMessage: Message = {
+        id: Date.now().toString() + Math.random(),
+        text,
+        isThought,
+        contextId: activeQualia.id,
+        contextName: activeQualia.name,
+      };
+      setMessages((prevMessages) => [...prevMessages, newMessage]);
+    },
+    [activeQualia],
+  );
 
   // Process messages to include delimiters when context switches in the history.
   const displayMessages = useMemo(() => {
@@ -361,15 +437,28 @@ const AppContent = () => {
   }, [userQualia, activeQualia, messages.length, addMessage]);
 
   // --- Core Logic (Simulated Backend) ---
-  registerCallback(({ communication }: { communication: CommunicationT }) => {
-    addMessage(
-      communication.message,
-      communication.fromQualiaId !== activeQualia.id,
+  useEffect(() => {
+    if (!userId) {
+      return;
+    }
+    const unsubscribePromise = registerClientMessageClb(
+      (communication: Communication) =>
+        Promise.resolve().then(() => {
+          let message = communication.message;
+          const isThought = communication.fromQualiaId !== activeQualia.id;
+          if (isThought) {
+            message = `[${communication.fromQualiaName}]: ${communication.message}`;
+          }
+          addMessage(message, isThought);
+        }),
     );
-  });
+    return () => {
+      unsubscribePromise.then((unsub) => unsub());
+    };
+  }, [userId]);
 
   const processInput = useCallback(
-    (input, contextQualia, isThinkingInput) => {
+    async (input: string, contextQualia: ContextQualia, isThinkingInput: boolean) => {
       if (!input || input.trim().length === 0) return;
 
       // 1. Handle Onboarding Flow Initiation
@@ -377,7 +466,10 @@ const AppContent = () => {
         // First time setup (providing the name)
         const name = input.trim();
         if (name.length > 1) {
-          const newUserQualia = { id: `user-${Date.now()}`, name: name };
+          const newUserQualia: ContextQualia = {
+            id: await getUserId(),
+            name: name,
+          };
           setUserQualia(newUserQualia);
 
           // (Context remains ONBOARDING_QUALIA)
@@ -419,7 +511,7 @@ const AppContent = () => {
         setTimeout(() => {
           const reflection = `Processed input: "${input.substring(0, 20)}..."`;
           // Semantically, this is an internal process (thought), but UI will display it normally.
-          sendMessage(input);
+          sendMessage({ toQualia: contextQualia, message: input, contextQualia, });
           addMessage(reflection, true);
         }, 300);
         return;
@@ -437,7 +529,7 @@ const AppContent = () => {
             ? `Defining ${contextQualia.name}`
             : `Thought recorded regarding ${contextQualia.name}`;
 
-          sendMessage(input, contextQualia.id);
+          sendMessage({ toQualia: userQualia, message: input, contextQualia })
           addMessage(
             `(${thoughtContext}. Input: "${input.substring(0, 20)}...")`,
             true,
@@ -464,6 +556,7 @@ const AppContent = () => {
         // This will be shown normally.
         addMessage(response, false);
       }, 1200);
+      sendMessage({ toQualia: contextQualia, message: input, contextQualia });
     },
     [userQualia, addMessage],
   );
@@ -471,7 +564,7 @@ const AppContent = () => {
   // --- Input Handling ---
 
   const sendChunk = useCallback(
-    (chunk, thinking) => {
+    (chunk: string, thinking: boolean) => {
       if (chunk.trim().length > 0) {
         processInput(chunk.trim(), activeQualia, thinking);
       }
@@ -481,7 +574,7 @@ const AppContent = () => {
 
   // finalizeInput accepts the mode explicitly to handle asynchronous state updates robustly
   const finalizeInput = useCallback(
-    (mode) => {
+    (mode: boolean) => {
       if (timerRef.current) {
         clearTimeout(timerRef.current);
         timerRef.current = null;
@@ -498,7 +591,7 @@ const AppContent = () => {
     [sendChunk],
   );
 
-  const handleInputChange = (text) => {
+  const handleInputChange = (text: string) => {
     // Enter key toggles mode only if user is established AND not talking to self
     if (text.endsWith("\n") && userQualia && !isTalkingToSelf) {
       toggleMode();
@@ -512,7 +605,9 @@ const AppContent = () => {
     }
 
     let newIndex = lastSentIndexRef.current;
-    if (text.endsWith(" ")) {
+    // Send chunk if punctuation is detected
+    const punctuationMarks = [".", "!", "?", ";", ","];
+    if (text && punctuationMarks.includes(text.charAt(text.length - 1))) {
       const chunk = text.substring(lastSentIndexRef.current);
       sendChunk(chunk, isThinkingMode);
       newIndex = text.length;
@@ -545,17 +640,16 @@ const AppContent = () => {
 
   // Handles the creation flow logic
   const createAndSwitchToQualia = useCallback(
-    (name) => {
+    (name: string) => {
       if (!userQualia) return;
 
       // 1. Finalize pending input
       finalizeInput(isThinkingMode);
 
       // 2. Create the new Qualia object
-      const newQualia = {
+      const newQualia: ContextQualia = {
         id: `q-new-${Date.now()}`, // Prefix helps identify newly created qualia in processInput
         name: name,
-        frecency: 1,
       };
 
       // 3. Add to contacts
@@ -582,8 +676,20 @@ const AppContent = () => {
   );
 
   // Handler for actions from the switcher (unified CREATE and SWITCH)
+  interface SwitchQualiaAction {
+    type: "SWITCH";
+    qualia: ContextQualia;
+  }
+
+  interface CreateQualiaAction {
+    type: "CREATE";
+    name: string;
+  }
+
+  type SwitcherAction = SwitchQualiaAction | CreateQualiaAction;
+
   const handleSwitcherAction = useCallback(
-    (action) => {
+    (action: SwitcherAction) => {
       if (action.type === "CREATE") {
         createAndSwitchToQualia(action.name);
       } else if (action.type === "SWITCH") {
@@ -615,8 +721,9 @@ const AppContent = () => {
 
   // Ensure FlatList scrolls to bottom on new messages (using displayMessages which includes delimiters)
   useEffect(() => {
-    if (flatListRef.current && displayMessages.length > 0) {
-      setTimeout(() => flatListRef.current.scrollToEnd({ animated: true }), 50);
+    if (displayMessages.length > 0) {
+      // Use optional chaining to avoid calling scrollToEnd on a null ref
+      setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 50);
     }
   }, [displayMessages]);
 
@@ -660,6 +767,7 @@ const AppContent = () => {
           style={styles.chatList}
           contentContainerStyle={styles.chatListContent}
           keyboardShouldPersistTaps="handled"
+          scrollEventThrottle={16}
         />
 
         {/* Input Area */}
@@ -675,8 +783,7 @@ const AppContent = () => {
             autoFocus={true}
             selectionColor={theme.accent}
             underlineColorAndroid="transparent"
-            blurOnSubmit={false}
-            showsVerticalScrollIndicator={false}
+            submitBehavior="newline"
           />
           {/* Requirement: Don't show thinking/speaking toggle when talking to own qualia. 
               Also hide until userQualia is established. */}
@@ -787,7 +894,7 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     paddingHorizontal: 0,
     borderWidth: 0,
-    ...(Platform.OS === "web" && { outlineStyle: "none" }),
+    ...(Platform.OS === "web" && ({ outlineStyle: "none" } as any)),
     maxHeight: FONT_SIZE * 6,
   },
   modeToggle: {
@@ -807,7 +914,7 @@ const styles = StyleSheet.create({
     fontFamily: FONT_FAMILY,
     padding: 0,
     borderWidth: 0,
-    ...(Platform.OS === "web" && { outlineStyle: "none" }),
+    ...(Platform.OS === "web" && ({ outlineStyle: "none" } as any)),
   },
   switcherButton: {
     marginLeft: 15,
@@ -831,12 +938,6 @@ const App = () => {
   return (
     <SafeAreaProvider>
       <AppContent />
-      <script src="https://www.gstatic.com/firebasejs/ui/6.0.1/firebase-ui-auth.js"></script>
-      <link
-        type="text/css"
-        rel="stylesheet"
-        href="https://www.gstatic.com/firebasejs/ui/6.0.1/firebase-ui-auth.css"
-      />
     </SafeAreaProvider>
   );
 };
