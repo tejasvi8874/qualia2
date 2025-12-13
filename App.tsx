@@ -444,6 +444,8 @@ const AppContent = () => {
   const [confirmationResult, setConfirmationResult] = useState<ConfirmationResult | null>(null);
   const [verificationId, setVerificationId] = useState<string | null>(null);
   const [inputText, setInputText] = useState("");
+  const [audioHtml, setAudioHtml] = useState<string>("");
+  const [authHtml, setAuthHtml] = useState<string>("");
 
   const postToAuthWebView = useCallback((payload: object) => {
     const message = JSON.stringify(payload);
@@ -962,23 +964,54 @@ const AppContent = () => {
     }
   }, [activeQualia, userQualia, addMessage]);
 
+  const startAudio = async (systemInstruction?: string) => {
+    if (Platform.OS === 'web') {
+      const session = await startAudioSession(
+        onTranscriptPart,
+        onTranscriptFlush,
+        systemInstruction
+      );
+      setLiveSession(session);
+    } else {
+      const user = auth.currentUser;
+      if (!user) {
+        console.log("Not authenticated; cannot start call.");
+        setIsCalling(false);
+        return;
+      }
+      console.log("sent message")
+      let idToken;
+      try {
+        idToken = await callCloudFunction(FUNCTION_NAMES.GET_CUSTOM_TOKEN, {});
+        console.log("Got custom token:", idToken);
+      } catch (e) {
+        console.error("Error getting custom token:", e);
+        throw e;
+      }
+      console.log("Loggin in with token ", idToken)
+      webviewRef.current?.postMessage(JSON.stringify({ type: 'start', systemInstruction, idToken }));
+    }
+  };
+
+  const stopAudio = () => {
+    if (Platform.OS === 'web') {
+      if (liveSession) {
+        liveSession.close();
+      }
+    } else {
+      const stopMsg = JSON.stringify({ type: 'stop' });
+      if (audioWebViewReady.current && webviewRef.current) {
+        webviewRef.current.postMessage(stopMsg);
+      } else {
+        pendingAudioCommand.current = stopMsg;
+      }
+    }
+  };
+
   const handleCall = async () => {
     if (isCalling) {
       console.log("Ending call.");
-      if (Platform.OS === 'web') {
-        if (liveSession) {
-          liveSession.close();
-          setLiveSession(null);
-        }
-      } else {
-        const stopMsg = JSON.stringify({ type: 'stop' });
-        if (audioWebViewReady.current && webviewRef.current) {
-          webviewRef.current.postMessage(stopMsg);
-        } else {
-          pendingAudioCommand.current = stopMsg;
-        }
-      }
-      setIsCalling(false);
+      stopAudio();
     } else {
       console.log("Starting call.");
       addMessage("(Call started)", "ui");
@@ -1008,20 +1041,14 @@ const AppContent = () => {
         );
         setLiveSession(session);
       } else {
-        // Native path: delegate to WebView (WebSockets available there)
-        const user = auth.currentUser;
-        if (!user) {
-          console.log("Not authenticated; cannot start call.");
-          setIsCalling(false);
-          return;
-        }
-        let idToken = "temp";
-        console.log("starting audio session")
+        console.log("sent message")
+        let idToken;
         try {
           idToken = await callCloudFunction(FUNCTION_NAMES.GET_CUSTOM_TOKEN, {});
           console.log("Got custom token:", idToken);
         } catch (e) {
           console.error("Error getting custom token:", e);
+          throw e;
         }
         console.log("Loggin in with token ", idToken)
         const startMsg = JSON.stringify({ type: 'start', systemInstruction, idToken });
@@ -1257,24 +1284,34 @@ const AppContent = () => {
             </TouchableOpacity>
           )}
         </View>
+      </KeyboardAvoidingView>
 
-        <QualiaSwitcher
-          visible={isSwitcherVisible}
-          onClose={() => setIsSwitcherVisible(false)}
-          contacts={contacts}
-          userQualia={userQualia}
-          onAction={handleSwitcherAction}
-          theme={theme}
-          onSignOut={handleSignOut}
-        />
-        <View nativeID="sign-in-button" />
-        {Platform.OS !== 'web' && (
+      <QualiaSwitcher
+        visible={isSwitcherVisible}
+        onClose={() => setIsSwitcherVisible(false)}
+        contacts={contacts}
+        userQualia={userQualia}
+        onAction={handleSwitcherAction}
+        theme={theme}
+        onSignOut={handleSignOut}
+      />
+      <View nativeID="sign-in-button" />
+      {Platform.OS !== 'web' && !userQualia && (
+        <View
+          style={{
+            width: '100%', height: 100,
+            position: 'absolute', top: 0, left: 0,
+            borderColor: 'red',
+            borderWidth: 10,
+            // opacity: 0.1,
+          }}
+        >
           <WebView
             ref={authWebViewRef}
-            style={{ position: 'absolute', width: 1, height: 1, opacity: 0, top: 0, left: 0 }}
             source={require('./public/webview/auth.html')}
             injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
             onMessage={(event) => {
+              console.log("Auth WebView message received", event.nativeEvent.data.slice(0, 100));
               try {
                 const raw = event.nativeEvent.data;
                 const data = typeof raw === "string"
@@ -1282,16 +1319,14 @@ const AppContent = () => {
                   : raw;
                 if (data.type === 'verificationId') {
                   setVerificationId(data.verificationId || null);
-                  setGraphError(null);
                 } else if (data.type === 'authError') {
-                  setGraphError(`Auth Error: ${data.message || 'Unknown error'}`);
+                  console.log(`Auth Error: ${data.message || 'Unknown error'}`);
                 } else if (data.type === 'log') {
                   console.log("Auth WebView:", data.message);
                 } else if (data.type === 'raw') {
                   console.log("Auth WebView raw:", data.message);
                 } else if (data.type === 'ready') {
                   authWebViewReady.current = true;
-                  setGraphError(null);
                   if (pendingAuthCommand.current && authWebViewRef.current) {
                     authWebViewRef.current.postMessage(pendingAuthCommand.current);
                     pendingAuthCommand.current = null;
@@ -1310,26 +1345,55 @@ const AppContent = () => {
             }}
             originWhitelist={["*"]}
           />
-        )}
-        {Platform.OS !== 'web' && userQualia && (
-          <WebView
-            ref={webviewRef}
-            style={{ position: 'absolute', width: 1, height: 1, opacity: 0, top: 0, left: 0 }}
-            source={require('./public/webview/audio.html')}
-            injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
-            onMessage={(event) => {
-              const data = JSON.parse(event.nativeEvent.data);
-              if (data.type === 'user') {
-                onTranscriptFlush('user', data.message);
-              } else if (data.type === 'gemini') {
-                onTranscriptFlush('gemini', data.message);
-              } else if (data.type === 'ended') {
-                onTranscriptFlush('ended', '');
+        </View>)}
+      {Platform.OS !== 'web' && userQualia && (
+        <WebView
+          ref={webviewRef}
+          style={{ position: 'absolute', width: 100, height: 100, borderWidth: 10, borderColor: 'red', opacity: 100, top: 0, left: 0 }}
+          source={{ html: audioHtml, baseUrl: 'https://localhost' }}
+          injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
+          onMessage={(event) => {
+            const raw = event.nativeEvent.data;
+            let data: any;
+            try {
+              data = typeof raw === "string" ? JSON.parse(raw) : raw;
+            } catch (err) {
+              console.warn("Audio WebView message parse failed", err, raw);
+              return;
+            }
+            if (data.type === 'user') {
+              onTranscriptFlush('user', data.message);
+            } else if (data.type === 'gemini') {
+              onTranscriptFlush('gemini', data.message);
+            } else if (data.type === 'ended') {
+              onTranscriptFlush('ended', '');
+              setIsCalling(false);
+            } else if (data.type === 'log') {
+              console.log("Audio WebView:", data.message);
+            } else if (data.type === 'ready') {
+              audioWebViewReady.current = true;
+              if (pendingAudioCommand.current && webviewRef.current) {
+                webviewRef.current.postMessage(pendingAudioCommand.current);
+                pendingAudioCommand.current = null;
               }
-            }}
-          />
-        )}
-    </SafeAreaView>
+            } else if (data.type === 'authError') {
+              console.log(`Audio Auth Error: ${data.message || 'Unknown error'}`);
+            }
+          }}
+          onLoad={() => {
+            audioWebViewReady.current = true;
+            if (pendingAudioCommand.current && webviewRef.current) {
+              webviewRef.current.postMessage(pendingAudioCommand.current);
+              pendingAudioCommand.current = null;
+            }
+          }}
+          allowsInlineMediaPlayback={true}
+          mediaPlaybackRequiresUserAction={false}
+          originWhitelist={["*"]}
+        />
+      )}
+    </KeyboardAvoidingView>
+    </SafeAreaView >
   );
 };
 

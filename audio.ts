@@ -74,6 +74,10 @@ async function ensureSignedIn(idToken: string) {
 
 let liveSession: LiveSession;
 
+import { AUDIO_GENERATION_CONFIG, processStreamMessages } from "./audioShared";
+
+// ...
+
 async function startAudioConversationWithInstruction(
     systemInstruction: string,
     idToken: string,
@@ -84,20 +88,8 @@ async function startAudioConversationWithInstruction(
         await ensureSignedIn(idToken);
         log("Signed in, starting audio session");
         model = getLiveGenerativeModel(ai, {
-            model: "gemini-live-2.5-flash-preview",
+            ...AUDIO_GENERATION_CONFIG,
             systemInstruction: systemInstruction,
-            generationConfig: {
-                // inputAudioTranscription: {},
-                // outputAudioTranscription: {},
-                responseModalities: ["AUDIO"],
-                speechConfig: {
-                    voiceConfig: {
-                        prebuiltVoiceConfig: {
-                            voiceName: "Aoede",
-                        },
-                    },
-                },
-            },
         });
     } catch (error: any) {
         log(`Failed to start audio session: ${error?.message || error}\n${error.stack} `);
@@ -132,61 +124,19 @@ async function startAudioConversationWithInstruction(
 }
 
 async function receiveMessages(session: LiveSession) {
-    const messageStream = session.receive();
-    const userTranscription: any = [];
-    const modelTranscription: any = [];
-    let userFlushTimeout: any = null;
-    let modelFlushTimeout: any = null;
-
     const postMessage = (type: any, message: any) => {
         (window as any).ReactNativeWebView?.postMessage(
             JSON.stringify({ type, message }),
         );
     };
 
-    const flushUser = () => {
-        if (userFlushTimeout) clearTimeout(userFlushTimeout);
-        userFlushTimeout = null;
-        if (userTranscription.length > 0) {
-            postMessage("user", userTranscription.join(""));
-            userTranscription.length = 0;
-        }
-    };
-    const flushModel = () => {
-        if (modelFlushTimeout) clearTimeout(modelFlushTimeout);
-        modelFlushTimeout = null;
-        if (modelTranscription.length > 0) {
-            postMessage("gemini", modelTranscription.join(""));
-            modelTranscription.length = 0;
-        }
-    };
-
-    try {
-        for await (const message of messageStream) {
-            if (message.type === "serverContent") {
-                if (message.inputTranscription?.text) {
-                    flushModel();
-                    userTranscription.push(message.inputTranscription.text);
-                    if (userFlushTimeout) clearTimeout(userFlushTimeout);
-                    userFlushTimeout = setTimeout(flushUser, 1000);
-                }
-                if (message.outputTranscription?.text) {
-                    flushUser();
-                    modelTranscription.push(message.outputTranscription.text);
-                    if (modelFlushTimeout) clearTimeout(modelFlushTimeout);
-                    modelFlushTimeout = setTimeout(flushModel, 1000);
-                }
-                if (message.turnComplete) {
-                    flushUser();
-                    flushModel();
-                }
-            }
-        }
-    } finally {
-        flushUser();
-        flushModel();
-        postMessage("ended", "");
-    }
+    await processStreamMessages(session, {
+        onUserPart: (text) => postMessage("user-part", text),
+        onModelPart: (text) => postMessage("gemini-part", text),
+        onUserFlush: (text) => postMessage("user", text),
+        onModelFlush: (text) => postMessage("gemini", text),
+        onEnded: () => postMessage("ended", ""),
+    });
 }
 
 

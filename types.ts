@@ -186,9 +186,6 @@ export interface FunctionResult {
   error?: string;
 }
 
-import { FUNCTION_NAMES } from "./functions/src/shared";
-
-export type FunctionName = typeof FUNCTION_NAMES[keyof typeof FUNCTION_NAMES];
 
 export interface FunctionCall {
   id?: string;

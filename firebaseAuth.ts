@@ -19,7 +19,6 @@ initializeFirestore(app, {
         ? persistentLocalCache({ tabManager: persistentMultipleTabManager() })
         : persistentLocalCache()
 });
-console.log({ Constants, p: Constants.platform, w: Constants.platform?.web });
 initializeAuth(app, { persistence: Constants.platform?.web ? browserLocalPersistence : getReactNativePersistence(ReactNativeAsyncStorage) });
 export const auth = getAuth(app);
 auth.useDeviceLanguage();
