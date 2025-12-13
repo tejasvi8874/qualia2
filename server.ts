@@ -33,10 +33,12 @@ import { ai, db, rtdb, installations } from "./firebaseAuth";
 import { ref as databaseRef, set, remove, onDisconnect } from "firebase/database";
 import { getId } from "firebase/installations";
 
-import { RateLimiter, withRetry } from "./requestUtils";
+import { RateLimiter, withRetry, BatchProcessor } from "./requestUtils";
 
 export async function messageListener() {
-    return getMessageListener(await getUserId(), await communicationsCollection(), or(where("fromQualiaId", "!=", await getUserId()), where("communicationType", "!=", "QUALIA_TO_HUMAN")), messageHandler, true, "seen");
+    // We use 'in' (equality) for communicationType and '!=' (inequality) for fromQualiaId.
+    // This is valid in Firestore as long as we don't have multiple inequality filters on different fields.
+    return getMessageListener(await getUserId(), await communicationsCollection(), and(where("fromQualiaId", "!=", await getUserId()), where("communicationType", "in", ["HUMAN_TO_QUALIA", "QUALIA_TO_QUALIA", "HUMAN_TO_HUMAN"])), messageHandler, true, "seen");
 }
 
 const safetySettings = Object.values(HarmCategory).map((category) => ({ category, threshold: HarmBlockThreshold.BLOCK_NONE }));
@@ -51,9 +53,11 @@ const summarizerModel = flashModel(Schema.object({
     },
 }));
 
-const getResponseCommunicationsRateLimiter = new RateLimiter(60);
+const getResponseCommunicationsRateLimiter = new RateLimiter(60, "ResponseCommunications");
+const summarizerRateLimiter = new RateLimiter(3, "Summarizer");
+const integrationRateLimiter = new RateLimiter(60, "Integration");
 
-async function getResponseCommunications(qualiaDoc: QualiaDoc, qualia: Qualia, communication: Partial<Communication>): Promise<Communications> {
+async function getResponseCommunications(qualiaDoc: QualiaDoc, qualia: Qualia, communications: Partial<Communication>[]): Promise<Communications> {
     console.log("Awaiting rate limiter...");
     await getResponseCommunicationsRateLimiter.acquire();
     console.log("Rate limiter acquired");
@@ -62,7 +66,7 @@ async function getResponseCommunications(qualiaDoc: QualiaDoc, qualia: Qualia, c
     const pendingCommunications = await getPendingCommunications(qualia.qualiaId);
 
     const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
-    const prompt = `Generate new commmunications if required, keeping previous conversations in mind:\n${JSON.stringify({ myQualiaId: qualia.qualiaId, qualia: serializedQualia, money: qualia.money, communication: communication })}`;
+    const prompt = `Generate new commmunications if required, keeping previous conversations in mind:\n${JSON.stringify({ myQualiaId: qualia.qualiaId, qualia: serializedQualia, money: qualia.money, newCommunications: communications })}`;
     console.log(`Calling Gemini with prompt: ${prompt.substring(0, 100)}...`);
     const result = await communicationModel.generateContent(prompt);
     const response = JSON.parse(result.response.text());
@@ -77,6 +81,8 @@ async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunicatio
         prompt += `\n\nPrevious integration attempt failed: ${errorInfo}. Please resolve.`;
     }
     console.log(`Calling Gemini for integration with prompt length: ${prompt.length}`);
+    console.log("Awaiting integration rate limiter...");
+    await integrationRateLimiter.acquire();
     const result = await integrationModel.generateContent(prompt);
     return JSON.parse(result.response.text());
 }
@@ -128,6 +134,8 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
         while (true) {
             try {
                 const currentPrompt = errorInfo ? prompt + `\n\nPrevious attempt failed:\n\n${errorInfo}` : prompt;
+                console.log("Awaiting integration rate limiter...");
+                await integrationRateLimiter.acquire();
                 const result = await integrationModel.generateContent(currentPrompt);
                 ops = JSON.parse(result.response.text()) as IntegrationResponse;
                 lastOperations = ops.operations;
@@ -330,118 +338,135 @@ export async function updateContacts(contacts: Contact[]): Promise<void> {
     }
 }
 
+const messageBatchProcessor = new BatchProcessor<Communication>(
+    new RateLimiter(60, "MessageBatcher"),
+    async (batch) => {
+        if (batch.length === 0) return;
+        console.log(`Processing batch of ${batch.length} messages`);
+
+        // Group messages by Qualia to handle them in context
+        const messagesByQualia = new Map<string, Communication[]>();
+        for (const comm of batch) {
+            const qualiaId = comm.toQualiaId;
+            if (!qualiaId) continue;
+            if (!messagesByQualia.has(qualiaId)) {
+                messagesByQualia.set(qualiaId, []);
+            }
+            messagesByQualia.get(qualiaId)!.push(comm);
+        }
+
+        for (const [qualiaId, communications] of messagesByQualia) {
+            try {
+                const qualiaDocRef = await getQualiaDocRef(qualiaId);
+                let qualiaDoc = (await getDoc(qualiaDocRef)).data() as QualiaDoc;
+                const qualia = await getQualia(qualiaId);
+
+                // Update contacts for all communications
+                const contacts: Contact[] = [];
+                for (const comm of communications) {
+                    if (comm.fromQualiaId) {
+                        contacts.push({
+                            names: comm.fromQualiaName ? [comm.fromQualiaName] : [],
+                            qualiaId: comm.fromQualiaId,
+                            lastContactTime: Timestamp.now()
+                        });
+                    }
+                    // Mark as received
+                    if (comm.id) {
+                        const commRef = doc(await communicationsCollection(), comm.id);
+                        await updateDoc(commRef, { receivedTime: Timestamp.now() });
+                    }
+                }
+                await updateContacts(contacts);
+
+                // Generate response for the batch
+                // We pass the last communication as the "trigger" but the prompt will include all pending
+                // Actually, getResponseCommunications fetches pending communications internally.
+                // So we just need to trigger it once per Qualia.
+                // However, we should pass the *new* messages as context if they aren't in pending yet?
+                // They SHOULD be in pending because they are in the collection and not acked.
+                // But we might want to pass them explicitly if we want to be sure.
+                // For now, let's assume they are in pending.
+                // We use the last communication to drive the "communication" argument if needed,
+                // or we update getResponseCommunications to take a batch.
+                // Let's update getResponseCommunications to take a batch.
+
+                const response = await getResponseCommunications(qualiaDoc, qualia, communications);
+
+                const validCommunications: Communication[] = [];
+                if (response.communications.length > 0) {
+                    for (const comm of response.communications) {
+                        validCommunications.push(await getValidCommunication(comm));
+                    }
+                } else {
+                    console.log(`No new communications generated for batch.`);
+                }
+
+                // Send outgoing messages
+                await Promise.all(validCommunications.map(comm => communicationsCollection().then(
+                    collection => addDoc(collection, comm))));
+
+                // Update contacts from outgoing messages
+                const outgoingContacts: Contact[] = [];
+                for (const comm of response.communications) {
+                    if (comm.toQualiaName && comm.toQualiaId) {
+                        outgoingContacts.push({
+                            names: [comm.toQualiaName],
+                            qualiaId: comm.toQualiaId,
+                            lastContactTime: Timestamp.now(),
+                        });
+                    }
+                }
+                await updateContacts(outgoingContacts);
+
+                // Trigger integration
+                triggerIntegration(qualiaId);
+
+            } catch (e) {
+                console.error(`Error processing message batch for qualia ${qualiaId}:`, e);
+            }
+        }
+    },
+    "MessageBatchProcessor"
+);
+
 async function messageHandler(communication: Communication): Promise<void> {
-    console.log(`Handling message on communication: ${JSON.stringify(communication)}`);
-    const qualiaId = communication.toQualiaId;
-    /*
-    get qualia doc data
-    read the message
-    create new communications
-    */
-    const qualiaDocRef = await getQualiaDocRef(qualiaId);
-    let qualiaDoc = (await getDoc(qualiaDocRef)).data() as QualiaDoc;
-    console.log(`Retrieved qualia doc: ${JSON.stringify(qualiaDoc).substring(0, 100)}...`);
-
-    let relevantCommunication: Partial<Communication>;
-    let contacts: Contact[] = [];
-    if (communication.communicationType === "HUMAN_TO_QUALIA") {
-        relevantCommunication = {
-            communicationType: communication.communicationType,
-            message: communication.message,
-            context: communication.context
-        };
-    }
-    else {
-        relevantCommunication = {
-            fromQualiaId: communication.fromQualiaId,
-            fromQualiaName: communication.fromQualiaName,
-            money: communication.money,
-            message: communication.message,
-            context: communication.context
-        };
-        if (!communication.fromQualiaId) {
-            throw new Error("Missing fromQualiaId");
-        }
-        contacts = [{
-            names: communication.fromQualiaName ? [communication.fromQualiaName] : [],
-            qualiaId: communication.fromQualiaId,
-            lastContactTime: Timestamp.now()
-        }];
-    }
-    relevantCommunication.isoDeliveryTime = new Date().toISOString();
-
-    // Set receivedTime to mark when this message was processed
-    if (communication.id) {
-        const commRef = doc(await communicationsCollection(), communication.id);
-        await updateDoc(commRef, { receivedTime: Timestamp.now() });
-    }
-
-    // Generate response communications
-    const communications = await getResponseCommunications(qualiaDoc, await getQualia(qualiaId), relevantCommunication);
-
-    const validCommunications: Communication[] = [];
-    if (communications.communications.length > 0) {
-        for (const comm of communications.communications) {
-            validCommunications.push(await getValidCommunication(comm));
-        }
-    } else {
-        console.log(`No new communications generated.`);
-    }
-
-    // Send outgoing messages
-    await Promise.all(validCommunications.map(comm => communicationsCollection().then(
-        collection => addDoc(collection, comm))));
-    console.log(`All communications added to collection.`);
-
-    for (const comm of communications.communications) {
-        if (comm.toQualiaName && comm.toQualiaId) {
-            contacts.push({
-                names: [comm.toQualiaName],
-                qualiaId: comm.toQualiaId,
-                lastContactTime: Timestamp.now(),
-            });
-        }
-    }
-    await updateContacts(contacts);
-    console.log(`Message handling complete for communication: ${JSON.stringify(communication)}`);
-
-    // Trigger integration immediately
-    // triggerIntegration(qualiaId);
-}
-
-const integrationStates = new Map<string, { promise: Promise<void> | null, pending: boolean }>();
-
-async function triggerIntegration(qualiaId: string) {
-    let state = integrationStates.get(qualiaId);
-    console.log("triggerIntegration", { qualiaId, state })
-    if (!state) {
-        state = { promise: null, pending: false };
-        integrationStates.set(qualiaId, state);
-    }
-
-    if (state.promise) {
-        state.pending = true;
+    // Filter out QUALIA_TO_HUMAN messages if they somehow got here (though toQualiaId check usually prevents this)
+    if (communication.communicationType === "QUALIA_TO_HUMAN") {
+        console.log(`Skipping QUALIA_TO_HUMAN message: ${communication.id}`);
         return;
     }
 
-    const run = async () => {
-        try {
-            const qualiaDocRef = await getQualiaDocRef(qualiaId);
-            await attemptIntegration(qualiaDocRef, qualiaId);
-        } catch (e) {
-            console.error(`Error in triggered integration for ${qualiaId}:`, e);
-        } finally {
-            state!.promise = null;
-            if (state!.pending) {
-                state!.pending = false;
-                triggerIntegration(qualiaId);
-            } else {
-                integrationStates.delete(qualiaId);
-            }
-        }
-    };
+    console.log(`Queueing message for batch processing: ${communication.id}`);
+    messageBatchProcessor.add(communication);
+}
 
-    state.promise = run();
+const integrationBatchProcessor = new BatchProcessor<string>(
+    new RateLimiter(60, "IntegrationBatcher"),
+    async (batch) => {
+        if (batch.length === 0) return;
+        console.log(`Processing integration batch of ${batch.length} triggers`);
+
+        // Deduplicate qualiaIds
+        const uniqueQualiaIds = Array.from(new Set(batch));
+        console.log(`Unique qualiaIds in batch: ${uniqueQualiaIds.join(", ")}`);
+
+        // Process integrations concurrently (RateLimiter inside attemptIntegration/integrateCommunications will handle throttling)
+        await Promise.all(uniqueQualiaIds.map(async (qualiaId) => {
+            try {
+                const qualiaDocRef = await getQualiaDocRef(qualiaId);
+                await attemptIntegration(qualiaDocRef, qualiaId);
+            } catch (e) {
+                console.error(`Error in triggered integration for ${qualiaId}:`, e);
+            }
+        }));
+    },
+    "IntegrationBatchProcessor"
+);
+
+async function triggerIntegration(qualiaId: string) {
+    console.log(`Triggering integration for ${qualiaId}`);
+    integrationBatchProcessor.add(qualiaId);
 }
 
 function startPendingCommunicationsListener(qualiaId: string) {
@@ -534,11 +559,9 @@ async function validateSizeReduction(oldDoc: QualiaDoc, newDoc: QualiaDoc, curre
 }
 
 async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: string) {
-    console.log("Attemping integration");
-    async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: string) {
-        console.log("Attemping integration");
+    console.log("Attempting integration");
 
-        const result = await runWithLock(
+    const result = await runWithLock(
             qualiaDocRef,
             async (lock) => {
                 console.log(`Integration started for qualia ${qualiaId}`);
@@ -671,7 +694,6 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
             // Could not claim lock
             console.log("Could not claim lock for integration");
         }
-    }
 }
 
 export async function getQualiaDocRef(qualiaId: string) {
@@ -777,7 +799,9 @@ async function getQualiaDoc(qualiaId: string): Promise<DocumentReference> {
 
 export async function summarizeQualiaDoc(qualiaDoc: QualiaDoc): Promise<string> {
     const serialized = serializeQualia(qualiaDoc);
-    const prompt = `Organize the following Qualia Doc (knowledge graph) into a concise narrative that captures the core beliefs, memories, and current state. Do not leave out ANY details. Focus on what is most relevant for an audio conversation:\n${serialized}`;
+    const prompt = `Organize the following Qualia into a narrative that captures the core beliefs, memories, and current state. Do not leave out ANY details. Also highlight what is most relevant for an audio conversation:\n${serialized}`;
+    console.log("Awaiting summarizer rate limiter...");
+    await summarizerRateLimiter.acquire();
     const result = await summarizerModel.generateContent(prompt);
     const response = JSON.parse(result.response.text());
     return response.summary;
@@ -787,7 +811,9 @@ export async function summarizeConversations(conversations: Communication[], qua
     if (conversations.length === 0) return "";
     const serializedConversations = JSON.stringify(conversations);
     const serializedQualia = serializeQualia(qualiaDoc);
-    const prompt = `Organize the following recent conversations. Do not leave out ANY details. Focus on the key topics discussed and the user's sentiment. Use the provided Qualia Doc for context:\n\nQualia Doc:\n${serializedQualia}\n\nConversations:\n${serializedConversations}`;
+    const prompt = `Organize the following recent conversations. Do not leave out ANY details. Highlight the key topics discussed and the user's sentiment. Use the provided Qualia for context:\n\nQualia:\n${serializedQualia}\n\nConversations:\n${serializedConversations}`;
+    console.log("Awaiting summarizer rate limiter...");
+    await summarizerRateLimiter.acquire();
     const result = await summarizerModel.generateContent(prompt);
     const response = JSON.parse(result.response.text());
     return response.summary;
@@ -797,7 +823,9 @@ export async function summarizeOperations(operations: IntegrationOperation[], qu
     if (operations.length === 0) return "";
     const serializedOperations = JSON.stringify(operations);
     const serializedQualia = serializeQualia(qualiaDoc);
-    const prompt = `Organize the following integration operations (changes to the knowledge graph) into a brief "subconscious thought" or realization. Do not leave out ANY details. It should sound like an internal monologue. Use the provided Qualia Doc for context:\n\nQualia Doc:\n${serializedQualia}\n\nOperations:\n${serializedOperations}`;
+    const prompt = `Organize the following changes to the knowledge graph as highly detailed subconscious thoughts and realizations. Do not leave out ANY details. It should sound like an internal monologue. Use the provided Qualia for context:\n\nQualia:\n${serializedQualia}\n\nChanges:\n${serializedOperations}`;
+    console.log("Awaiting summarizer rate limiter...");
+    await summarizerRateLimiter.acquire();
     const result = await summarizerModel.generateContent(prompt);
     const response = JSON.parse(result.response.text());
     return response.summary;

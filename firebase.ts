@@ -46,7 +46,7 @@ export async function qualiaDocOperationsCollection() {
   return collection(db, "qualiaDocOperations");
 }
 
-export function getMessageListener(userId: string, collectionRef: CollectionReference<DocumentData, DocumentData>, echoFilter: QueryCompositeFilterConstraint, callback: (communication: Communication) => Promise<void>, singleListener: boolean, processedField: string = "ack") {
+export function getMessageListener(userId: string, collectionRef: CollectionReference<DocumentData, DocumentData>, echoFilter: QueryCompositeFilterConstraint | QueryFieldFilterConstraint, callback: (communication: Communication) => Promise<void>, singleListener: boolean, processedField: string = "ack") {
   console.log(`Registering message listener for userId: ${userId} and communicationTypeFilter: ${JSON.stringify(echoFilter)}`);
   // Filters excludes docs where the field is not set.
   const q = query(
@@ -154,6 +154,7 @@ export async function acquireLock(
   durationSeconds: number = PROCESSING_SECONDS,
   checkFn?: (data: DocumentData) => boolean
 ): Promise<boolean> {
+  console.log(`Acquiring lock for ${docRef.id}`);
   return await runTransaction(db, async (transaction) => {
     const doc = await transaction.get(docRef);
     if (!doc.exists()) return false;
@@ -162,20 +163,22 @@ export async function acquireLock(
     if (checkFn && !checkFn(data)) return false;
 
     if (data.processingBefore && getTimeToWait(data.processingBefore.toMillis(), durationSeconds * 2) > 0) {
+      console.log(`Lock already held for ${docRef.id}`);
       return false;
     }
 
     transaction.update(docRef, {
       processingBefore: Timestamp.fromMillis(Date.now() + durationSeconds * 1e3),
-      lockOwner: await getId(installations)
+      lockOwner: await getLockOwnerId()
     });
+    console.log(`Acquired lock for ${docRef.id}`);
     return true;
   });
 }
 
 export async function withDeviceLock<T>(docRef: DocumentReference, work: () => Promise<T>): Promise<T> {
   const userId = await getUserId();
-  const deviceId = await getId(installations);
+  const deviceId = await getLockOwnerId();
   const collectionId = docRef.parent.id;
   const docId = docRef.id;
   const lockRef = databaseRef(rtdb, `/locks/${userId}/${deviceId}/${collectionId}/${docId}`);
@@ -202,11 +205,14 @@ export async function runWithLock<T>(
   checkFn?: (data: DocumentData) => boolean
 ): Promise<T | undefined> {
   if (await acquireLock(docRef, durationSeconds, checkFn)) {
+    console.log(`Acquired lock for ${docRef.id}`);
     return await withDeviceLock(docRef, async () => {
+      console.log(`Acquired device lock for ${docRef.id}`);
       let released = false;
       const release = async () => {
         if (!released) {
           released = true;
+          console.log(`Releasing lock for ${docRef.id}`);
           await updateDoc(docRef, { processingBefore: null, lockOwner: null });
         }
       };
@@ -215,6 +221,7 @@ export async function runWithLock<T>(
         const result = await work({ release });
         // Auto-release on success if not already released
         await release();
+        console.log(`Released lock for ${docRef.id}`);
         return result;
       } catch (e) {
         // Auto-release on error too?
@@ -224,9 +231,26 @@ export async function runWithLock<T>(
         // If it's a permanent failure, we might want to handle it differently.
         // But for "processingBefore", it's a timeout lock. Releasing it is generally safer than holding it for the full timeout.
         await release();
+        console.error(`Failed to release lock for ${docRef.id}: ${e}`, e.stack);
         throw e;
       }
     });
   }
+  console.log(`Failed to acquire lock for ${docRef.id}`);
   return undefined;
+}
+
+let cachedLockOwnerId: string | null = null;
+async function getLockOwnerId(): Promise<string> {
+  if (cachedLockOwnerId) return cachedLockOwnerId;
+  try {
+    cachedLockOwnerId = await getId(installations);
+  } catch (e) {
+    // Fallback for Node.js environment where indexedDB is not available
+    console.log("Failed to get installation ID, using fallback:", e);
+    if (!cachedLockOwnerId) {
+      cachedLockOwnerId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+    }
+  }
+  return cachedLockOwnerId!;
 }

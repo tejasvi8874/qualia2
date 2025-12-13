@@ -130,6 +130,7 @@ export interface QualiaDoc {
   nextQualiaDocId: string;
   processingBefore?: Timestamp;
   createdTime: Timestamp;
+  lockOwner?: string;
 }
 
 export const INTEGRATION_SCHEMA = Schema.object({

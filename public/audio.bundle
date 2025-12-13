@@ -9532,6 +9532,15 @@
       callbacks.onEnded();
     }
   }
+  async function connectAndStartAudioSession(ai2, systemInstruction) {
+    const model = getLiveGenerativeModel(ai2, {
+      ...AUDIO_GENERATION_CONFIG,
+      systemInstruction
+    });
+    const session = await model.connect();
+    await startAudioConversation(session);
+    return session;
+  }
 
   // audio.ts
   var post = (payload) => window.ReactNativeWebView.postMessage(JSON.stringify(payload));
@@ -9586,14 +9595,10 @@
   var liveSession;
   async function startAudioConversationWithInstruction(systemInstruction, idToken) {
     log("Waiting for sign in");
-    let model;
     try {
       await ensureSignedIn(idToken);
       log("Signed in, starting audio session");
-      model = getLiveGenerativeModel(ai, {
-        ...AUDIO_GENERATION_CONFIG,
-        systemInstruction
-      });
+      liveSession = await connectAndStartAudioSession(ai, systemInstruction);
     } catch (error) {
       log(`Failed to start audio session: ${error?.message || error}
 ${error.stack} `);
@@ -9603,25 +9608,8 @@ ${error.stack} `);
       });
       throw error;
     }
-    log("Connecting to audio session");
-    liveSession = await model.connect();
-    log("Starting audio conversation");
-    try {
-      log("waiting startAudioConversation");
-      await startAudioConversation(liveSession);
-      log("finished wait");
-    } catch (error) {
-      log(
-        `Failed to start audio conversation: ${error?.message || error} `
-      );
-      post({
-        type: "audioError",
-        message: error?.message || "Failed to start audio conversation"
-      });
-      throw error;
-    }
-    liveSession.send("(call started)");
     log("Started audio conversation");
+    liveSession.send("(call started)");
     receiveMessages(liveSession);
   }
   async function receiveMessages(session) {
@@ -9650,6 +9638,11 @@ ${error.stack} `);
       } else if (data.type === "stop") {
         if (liveSession) {
           liveSession.close();
+        }
+      } else if (data.type === "send") {
+        if (liveSession) {
+          log(`Sending message to audio session: ${data.message}`);
+          liveSession.send(data.message);
         }
       }
     } catch (e) {
