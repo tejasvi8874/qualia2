@@ -92,3 +92,19 @@ export async function processStreamMessages(
         callbacks.onEnded();
     }
 }
+
+import { getLiveGenerativeModel, startAudioConversation, AI } from "firebase/ai";
+
+export async function connectAndStartAudioSession(
+    ai: AI,
+    systemInstruction?: string
+): Promise<LiveSession> {
+    const model = getLiveGenerativeModel(ai, {
+        ...AUDIO_GENERATION_CONFIG,
+        systemInstruction: systemInstruction,
+    });
+
+    const session = await model.connect();
+    await startAudioConversation(session);
+    return session;
+}

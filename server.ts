@@ -14,7 +14,7 @@ import {
     onSnapshot,
     or,
 } from "firebase/firestore";
-import { getGenerativeModel, HarmBlockThreshold, HarmCategory, ObjectSchema, GenerativeModel } from "firebase/ai";
+import { getGenerativeModel, HarmBlockThreshold, HarmCategory, ObjectSchema, GenerativeModel, Schema } from "firebase/ai";
 
 
 import { Communications, Communication, Contact, Contacts, QualiaDoc, Qualia, IntegrationResponse, IntegrationOperation, INTEGRATION_SCHEMA, COMMUNICATION_SCHEMA } from "./types";
@@ -45,6 +45,11 @@ const proModel = (schema: ObjectSchema) => getGenerativeModel(ai, { model: "gemi
 const flashModel = (schema: ObjectSchema) => getGenerativeModel(ai, { model: "gemini-2.5-flash-preview-09-2025", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 24576 }, }, safetySettings }, { timeout: 1200 * 1e3 });
 const communicationModel = flashModel(COMMUNICATION_SCHEMA);
 const integrationModel = proModel(INTEGRATION_SCHEMA);
+const summarizerModel = flashModel(Schema.object({
+    properties: {
+        summary: Schema.string(),
+    },
+}));
 
 const getResponseCommunicationsRateLimiter = new RateLimiter(60);
 
@@ -769,3 +774,31 @@ async function getQualiaDoc(qualiaId: string): Promise<DocumentReference> {
     return docs[0].ref;
 }
 
+
+export async function summarizeQualiaDoc(qualiaDoc: QualiaDoc): Promise<string> {
+    const serialized = serializeQualia(qualiaDoc);
+    const prompt = `Organize the following Qualia Doc (knowledge graph) into a concise narrative that captures the core beliefs, memories, and current state. Do not leave out ANY details. Focus on what is most relevant for an audio conversation:\n${serialized}`;
+    const result = await summarizerModel.generateContent(prompt);
+    const response = JSON.parse(result.response.text());
+    return response.summary;
+}
+
+export async function summarizeConversations(conversations: Communication[], qualiaDoc: QualiaDoc): Promise<string> {
+    if (conversations.length === 0) return "";
+    const serializedConversations = JSON.stringify(conversations);
+    const serializedQualia = serializeQualia(qualiaDoc);
+    const prompt = `Organize the following recent conversations. Do not leave out ANY details. Focus on the key topics discussed and the user's sentiment. Use the provided Qualia Doc for context:\n\nQualia Doc:\n${serializedQualia}\n\nConversations:\n${serializedConversations}`;
+    const result = await summarizerModel.generateContent(prompt);
+    const response = JSON.parse(result.response.text());
+    return response.summary;
+}
+
+export async function summarizeOperations(operations: IntegrationOperation[], qualiaDoc: QualiaDoc): Promise<string> {
+    if (operations.length === 0) return "";
+    const serializedOperations = JSON.stringify(operations);
+    const serializedQualia = serializeQualia(qualiaDoc);
+    const prompt = `Organize the following integration operations (changes to the knowledge graph) into a brief "subconscious thought" or realization. Do not leave out ANY details. It should sound like an internal monologue. Use the provided Qualia Doc for context:\n\nQualia Doc:\n${serializedQualia}\n\nOperations:\n${serializedOperations}`;
+    const result = await summarizerModel.generateContent(prompt);
+    const response = JSON.parse(result.response.text());
+    return response.summary;
+}

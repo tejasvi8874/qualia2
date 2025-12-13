@@ -74,7 +74,7 @@ async function ensureSignedIn(idToken: string) {
 
 let liveSession: LiveSession;
 
-import { AUDIO_GENERATION_CONFIG, processStreamMessages } from "./audioShared";
+import { AUDIO_GENERATION_CONFIG, processStreamMessages, connectAndStartAudioSession } from "./audioShared";
 
 // ...
 
@@ -83,14 +83,10 @@ async function startAudioConversationWithInstruction(
     idToken: string,
 ) {
     log("Waiting for sign in");
-    let model;
     try {
         await ensureSignedIn(idToken);
         log("Signed in, starting audio session");
-        model = getLiveGenerativeModel(ai, {
-            ...AUDIO_GENERATION_CONFIG,
-            systemInstruction: systemInstruction,
-        });
+        liveSession = await connectAndStartAudioSession(ai, systemInstruction);
     } catch (error: any) {
         log(`Failed to start audio session: ${error?.message || error}\n${error.stack} `);
         post({
@@ -100,26 +96,8 @@ async function startAudioConversationWithInstruction(
         throw error;
     }
 
-    log("Connecting to audio session");
-    liveSession = await model.connect();
-    // Note: In the WebView, we don't need the controller return value.
-    log("Starting audio conversation");
-    try {
-        log("waiting startAudioConversation")
-        await startAudioConversation(liveSession);
-        log("finished wait")
-    } catch (error: any) {
-        log(
-            `Failed to start audio conversation: ${error?.message || error} `,
-        );
-        post({
-            type: "audioError",
-            message: error?.message || "Failed to start audio conversation",
-        });
-        throw error;
-    }
-    liveSession.send("(call started)");
     log("Started audio conversation");
+    liveSession.send("(call started)");
     receiveMessages(liveSession);
 }
 
@@ -157,6 +135,11 @@ const handleMessage = (event: any) => {
         } else if (data.type === "stop") {
             if (liveSession) {
                 liveSession.close();
+            }
+        } else if (data.type === "send") {
+            if (liveSession) {
+                log(`Sending message to audio session: ${data.message}`);
+                liveSession.send(data.message);
             }
         }
     } catch (e: any) {

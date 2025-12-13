@@ -25,11 +25,11 @@ import { AudioModule } from 'expo-audio';
 import { File } from 'expo-file-system';
 import { registerClientMessageClb, sendMessage, getContacts, getHistoricalMessages, callCloudFunction } from './firebaseClientUtils';
 import { Communication, ContextQualia, QualiaDoc } from "./types";
-import { Timestamp, getDoc, addDoc, writeBatch, doc } from "firebase/firestore";
-import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef, updateContacts } from "./server";
+import { Timestamp, getDoc, addDoc, writeBatch, doc, query, where, onSnapshot } from "firebase/firestore";
+import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef, updateContacts, summarizeQualiaDoc, summarizeConversations, summarizeOperations } from "./server";
 import { serializeQualia } from "./graphUtils";
 import { auth, db } from "./firebaseAuth";
-import { communicationsCollection } from "./firebase";
+import { communicationsCollection, qualiaDocOperationsCollection } from "./firebase";
 import { RecaptchaVerifier, signInWithPhoneNumber, ConfirmationResult, PhoneAuthProvider, signInWithCredential, signInWithCustomToken } from "firebase/auth";
 import { firebaseConfig } from "./firebaseConfig";
 import { startAudioSession } from "./audioSession";
@@ -930,6 +930,7 @@ const AppContent = () => {
             ack: false,
             seen: true,
             deliveryTime: deliveryTime,
+            context: "audio call"
           };
           // Store for batching
           pendingUserCommunication.current = communication;
@@ -953,7 +954,8 @@ const AppContent = () => {
             communicationType: "QUALIA_TO_HUMAN",
             ack: false,
             seen: true,
-            deliveryTime: deliveryTime
+            deliveryTime: deliveryTime,
+            context: "audio call"
           };
           const geminiDocRef = doc(collection);
           batch.set(geminiDocRef, communication);
@@ -1030,9 +1032,14 @@ const AppContent = () => {
           const qualiaDocSnap = await getDoc(qualiaDocRef);
           const qualiaDoc = qualiaDocSnap.data() as QualiaDoc;
           const pendingCommunications = await getPendingCommunications(activeQualia.id);
-          const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
-          systemInstruction = `You are a qualia. Here is your memory and context:\n${JSON.stringify({ myQualiaId: activeQualia.id, qualia: serializedQualia, money: 100 })}`;
-          console.log("System instruction prepared with context.");
+
+          const [docSummary, convSummary] = await Promise.all([
+            summarizeQualiaDoc(qualiaDoc),
+            summarizeConversations(pendingCommunications, qualiaDoc)
+          ]);
+
+          systemInstruction = `You are a qualia. Here is your memory and context:\n${JSON.stringify({ myQualiaId: activeQualia.id, memorySummary: docSummary, recentConversationsSummary: convSummary, money: 100 })}\n\nNote: You may receive messages starting with "(your subconscious thoughts)". These are your own internal realizations and NOT dialogue from the user. Treat them as your own thoughts.`;
+          console.log("System instruction prepared with context:", systemInstruction);
         } catch (e) {
           console.error("Failed to fetch context for audio session:", e);
         }
@@ -1055,6 +1062,65 @@ const AppContent = () => {
 
 
 
+
+
+
+  // Subconscious Thoughts Injection
+  useEffect(() => {
+    if (!isCalling || !activeQualia || !userId) return;
+
+    let unsubscribe: () => void;
+
+    const setupListener = async () => {
+      const collection = await qualiaDocOperationsCollection();
+      // Listen for operations created after the call started (approx)
+      const q = query(
+        collection,
+        where("qualiaId", "==", activeQualia.id),
+        where("qualiaDocId", ">", "")
+      );
+
+      unsubscribe = onSnapshot(q, async (snapshot) => {
+        for (const change of snapshot.docChanges()) {
+          if (change.type === "added") {
+            const data = change.doc.data();
+            // Only process if it has a qualiaDocId (successful operation)
+            if (data.qualiaDocId) {
+              console.log("Injecting subconscious thoughts from operation:", change.doc.id);
+              try {
+                // Fetch the latest QualiaDoc for context
+                const qualiaDocRef = await getQualiaDocRef(activeQualia.id);
+                const qualiaDocSnap = await getDoc(qualiaDocRef);
+                const qualiaDoc = qualiaDocSnap.data() as QualiaDoc;
+
+                const summary = await summarizeOperations(data.operations, qualiaDoc);
+                if (summary) {
+                  const message = `(your subconscious thoughts): ${summary}`;
+                  console.log("Injecting subconscious thought:", message);
+                  if (Platform.OS === 'web') {
+                    liveSession?.send(message);
+                  } else {
+                    const sendMsg = JSON.stringify({ type: 'send', message });
+                    if (audioWebViewReady.current && webviewRef.current) {
+                      webviewRef.current.postMessage(sendMsg);
+                    }
+                  }
+                }
+              } catch (e) {
+                console.error("Error summarizing operations for subconscious thoughts:", e);
+              }
+            }
+          }
+        }
+      });
+    };
+
+    setupListener();
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [isCalling, activeQualia, userId, liveSession]);
 
   // Handles the creation flow logic
   const createAndSwitchToQualia = useCallback(

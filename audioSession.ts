@@ -5,18 +5,12 @@ import { Buffer } from 'buffer';
 
 // Parallel web implementation in audio.html
 
-import { AUDIO_GENERATION_CONFIG, processStreamMessages } from "./audioShared";
+import { AUDIO_GENERATION_CONFIG, processStreamMessages, connectAndStartAudioSession } from "./audioShared";
 
 // Parallel web implementation in audio.html
 
 export async function startAudioSession(onTranscriptPart: (type: 'user' | 'gemini', message: string) => void, onTranscriptFlush: (type: 'user' | 'gemini' | 'ended', message: string) => void, systemInstruction?: string): Promise<LiveSession> {
-    const model = getLiveGenerativeModel(ai, {
-        ...AUDIO_GENERATION_CONFIG,
-        systemInstruction: systemInstruction,
-    });
-
-    const session = await model.connect();
-    await startAudioConversation(session);
+    const session = await connectAndStartAudioSession(ai, systemInstruction);
     receiveMessages(session, onTranscriptPart, onTranscriptFlush);
     return session;
 }
