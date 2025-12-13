@@ -14,8 +14,10 @@ import {
   updateDoc,
   where,
 } from "firebase/firestore";
+import { ref as databaseRef, set, remove, onDisconnect } from "firebase/database";
+import { getId } from "firebase/installations";
 
-import { db, waitForUser } from "./firebaseAuth";
+import { db, waitForUser, rtdb, installations } from "./firebaseAuth";
 import { Communication } from "./types";
 import { withRetry } from "./requestUtils";
 
@@ -92,7 +94,7 @@ async function processData(data: Communication, ref: DocumentReference<DocumentD
     const timeToWait = getTimeToWait(processingBefore);
     if (timeToWait > 0) {
       // Deadline not hit yet, some other client is processing
-      await new Promise(resolve => setTimeout(resolve, timeToWait));
+      await waitForLockRelease(ref, timeToWait);
       const doc = await getDoc(ref);
       if (doc.exists() && !doc.data()![processedField]) {
         return await processData(data, ref, callback, processedField);
@@ -104,24 +106,16 @@ async function processData(data: Communication, ref: DocumentReference<DocumentD
 
 async function claimAndProcess(ref: DocumentReference<DocumentData, DocumentData>, callback: (communication: Communication) => Promise<void>, data: Communication, processedField: string): Promise<void> {
   try {
-    const claimed = await runTransaction(db, async (transaction) => {
-      const doc = await transaction.get(ref);
-      if (!doc.exists()) {
-        return false;
-      }
-      const data = doc.data() as Communication;
-      if (data[processedField as keyof Communication]) {
-        return false;
-      }
-      if (data.processingBefore && getTimeToWait(data.processingBefore.toMillis()) > 0) {
-        return false;
-      }
-      transaction.update(ref, { processingBefore: Timestamp.fromMillis(Date.now() + PROCESSING_SECONDS * 1e3) });
-      return true;
-    });
-    if (claimed) {
-      return await callback(data).then(() => updateDoc(ref, { [processedField]: true }));
-    } else {
+    const result = await runWithLock(
+      ref,
+      async (lock) => {
+        return await callback(data).then(() => updateDoc(ref, { [processedField]: true }));
+      },
+      PROCESSING_SECONDS,
+      (docData) => !docData[processedField]
+    );
+
+    if (result === undefined) {
       return await processData(data, ref, callback, processedField);
     }
   } catch (error) {
@@ -130,8 +124,109 @@ async function claimAndProcess(ref: DocumentReference<DocumentData, DocumentData
   }
 }
 
-function getTimeToWait(processingBefore: number) {
+export function getTimeToWait(processingBefore: number, maxProcessingSeconds: number = MAX_PROCESSING_SECONDS) {
   const waitTime = processingBefore - Date.now() + NETWORK_DELAY_SECONDS * 1e3;
-  const isValidProcessingBefore = waitTime > 0 && waitTime < MAX_PROCESSING_SECONDS * 1e3;
+  const isValidProcessingBefore = waitTime > 0 && waitTime < maxProcessingSeconds * 1e3;
   return isValidProcessingBefore ? waitTime : 0;
+}
+
+export async function waitForLockRelease(docRef: DocumentReference, maxWaitMs: number): Promise<void> {
+  console.log(`Waiting for lock release on ${docRef.id} for max ${maxWaitMs}ms`);
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      unsubscribe();
+      resolve();
+    }, maxWaitMs);
+
+    const unsubscribe = onSnapshot(docRef, (snapshot) => {
+      const data = snapshot.data();
+      if (!data || !data.processingBefore) {
+        clearTimeout(timeout);
+        unsubscribe();
+        resolve();
+      }
+    });
+  });
+}
+
+export async function acquireLock(
+  docRef: DocumentReference,
+  durationSeconds: number = PROCESSING_SECONDS,
+  checkFn?: (data: DocumentData) => boolean
+): Promise<boolean> {
+  return await runTransaction(db, async (transaction) => {
+    const doc = await transaction.get(docRef);
+    if (!doc.exists()) return false;
+    const data = doc.data();
+
+    if (checkFn && !checkFn(data)) return false;
+
+    if (data.processingBefore && getTimeToWait(data.processingBefore.toMillis(), durationSeconds * 2) > 0) {
+      return false;
+    }
+
+    transaction.update(docRef, {
+      processingBefore: Timestamp.fromMillis(Date.now() + durationSeconds * 1e3),
+      lockOwner: await getId(installations)
+    });
+    return true;
+  });
+}
+
+export async function withDeviceLock<T>(docRef: DocumentReference, work: () => Promise<T>): Promise<T> {
+  const userId = await getUserId();
+  const deviceId = await getId(installations);
+  const collectionId = docRef.parent.id;
+  const docId = docRef.id;
+  const lockRef = databaseRef(rtdb, `/locks/${userId}/${deviceId}/${collectionId}/${docId}`);
+
+  await set(lockRef, true);
+  await onDisconnect(lockRef).remove();
+
+  try {
+    return await work();
+  } finally {
+    await onDisconnect(lockRef).cancel();
+    await remove(lockRef);
+  }
+}
+
+export interface Lock {
+  release: () => Promise<void>;
+}
+
+export async function runWithLock<T>(
+  docRef: DocumentReference,
+  work: (lock: Lock) => Promise<T>,
+  durationSeconds: number = PROCESSING_SECONDS,
+  checkFn?: (data: DocumentData) => boolean
+): Promise<T | undefined> {
+  if (await acquireLock(docRef, durationSeconds, checkFn)) {
+    return await withDeviceLock(docRef, async () => {
+      let released = false;
+      const release = async () => {
+        if (!released) {
+          released = true;
+          await updateDoc(docRef, { processingBefore: null, lockOwner: null });
+        }
+      };
+
+      try {
+        const result = await work({ release });
+        // Auto-release on success if not already released
+        await release();
+        return result;
+      } catch (e) {
+        // Auto-release on error too?
+        // Yes, if we failed, we should probably release the lock so others can retry?
+        // Or do we want to keep it locked to prevent rapid retries of failing jobs?
+        // Usually, if it's a transient error, we might want to release.
+        // If it's a permanent failure, we might want to handle it differently.
+        // But for "processingBefore", it's a timeout lock. Releasing it is generally safer than holding it for the full timeout.
+        await release();
+        throw e;
+      }
+    });
+  }
+  return undefined;
 }

@@ -7,6 +7,8 @@ import {
     initializeFirestore,
 } from "firebase/firestore";
 import { getAI, GoogleAIBackend } from "firebase/ai";
+import { getDatabase } from "firebase/database";
+import { getInstallations } from "firebase/installations";
 
 import { initializeApp } from "firebase/app";
 import { firebaseConfig } from "./firebaseConfig";
@@ -50,3 +52,5 @@ export async function waitForUser(timeoutMs: number = 15000): Promise<User> {
 
 export const db = getFirestore(app);
 export const ai = getAI(app, { backend: new GoogleAIBackend() });
+export const rtdb = getDatabase(app);
+export const installations = getInstallations(app);

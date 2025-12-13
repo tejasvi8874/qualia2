@@ -33,7 +33,10 @@ setGlobalOptions({ maxInstances: 10 });
 
 import { initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
+import { getDatabase } from "firebase-admin/database";
+import { getFirestore, Timestamp } from "firebase-admin/firestore";
 import { onDocumentCreatedWithAuthContext } from "firebase-functions/v2/firestore";
+import { onValueWritten } from "firebase-functions/v2/database";
 import { FUNCTION_NAMES } from "./shared";
 
 
@@ -105,6 +108,110 @@ export const functionCalls = onDocumentCreatedWithAuthContext(
                     error: JSON.stringify(error),
                 },
             });
+        }
+    }
+);
+
+export const onUserStatusChanged = onValueWritten(
+    {
+        ref: "/status/{userId}/{deviceId}",
+        instance: "tstomar-experimental-default-rtdb",
+    },
+    async (event) => {
+        const eventStatus = event.data.after.val();
+        const userStatusFirestoreRef = getFirestore().collection("communications");
+        const userId = event.params.userId;
+
+        const currentDeviceId = event.params.deviceId;
+        const userStatusRef = getDatabase().ref(`status/${userId}`);
+        const snapshot = await userStatusRef.once("value");
+        const devices = snapshot.val() || {};
+
+        const otherOnlineDevices: string[] = [];
+        for (const deviceId in devices) {
+            if (deviceId !== currentDeviceId && devices[deviceId].state === "online") {
+                const platform = devices[deviceId].platform || "unknown";
+                const deviceName = devices[deviceId].deviceName || platform;
+                otherOnlineDevices.push(`${deviceName} (${platform})`);
+            }
+        }
+
+        let message = "";
+        const currentPlatform = eventStatus.platform || "unknown";
+        const currentDeviceName = eventStatus.deviceName || currentPlatform;
+
+        if (eventStatus.state === "online") {
+            // User joined
+            if (otherOnlineDevices.length > 0) {
+                // Scenario 2: Online -> Online (Additional Device)
+                message = `User also joined through ${currentDeviceName} (${currentPlatform}) while already online on [${otherOnlineDevices.join(", ")}].`;
+            } else {
+                // Scenario 1: Fully Offline -> Online (First Device)
+                message = `User joined using ${currentDeviceName} (${currentPlatform}).`;
+            }
+        } else {
+            // User left (offline)
+            if (otherOnlineDevices.length > 0) {
+                // Scenario 3: Online -> Online (One Device Leaves)
+                message = `User left ${currentDeviceName} but is still online on [${otherOnlineDevices.join(", ")}].`;
+            } else {
+                // Scenario 4: Online -> Fully Offline (Last Device Leaves)
+                message = `User is no longer active on any device.`;
+            }
+        }
+
+        await userStatusFirestoreRef.add({
+            fromQualiaId: userId,
+            toQualiaId: userId,
+            communicationType: "HUMAN_TO_QUALIA",
+            message: message,
+            deliveryTime: Timestamp.now(),
+            seen: true,
+            ack: false,
+            processingBefore: null,
+        });
+    }
+);
+
+export const onLockClaimReleased = onValueWritten(
+    {
+        ref: "/locks/{userId}/{deviceId}/{collectionId}/{docId}",
+        instance: "tstomar-experimental-default-rtdb",
+    },
+    async (event) => {
+        // Only trigger on deletion (lock release)
+        if (event.data.after.exists()) {
+            return;
+        }
+
+        const { deviceId, collectionId, docId } = event.params;
+        logger.info(`Lock claim released for ${collectionId}/${docId} by device ${deviceId}`);
+
+        const docRef = getFirestore().collection(collectionId).doc(docId);
+
+        try {
+            await getFirestore().runTransaction(async (transaction) => {
+                const doc = await transaction.get(docRef);
+                if (!doc.exists) return;
+
+                const data = doc.data();
+                // CRITICAL: Only clear the lock if it is still owned by the device that released the claim.
+                // This prevents "Split Brain" or "Double Locking" race conditions:
+                // 1. Device A holds lock, finishes work, and releases lock (processingBefore: null).
+                // 2. Device B immediately acquires lock (processingBefore: <time>, lockOwner: Device B).
+                // 3. Device A's cleanup (RTDB deletion) triggers this Cloud Function.
+                // 4. Without this check, we would wipe Device B's valid lock.
+                // 5. Device C could then acquire the lock, leading to B and C both thinking they have exclusive access.
+                // Even with immutable docs, this causes wasted work, orphaned documents (forks), and error noise.
+                if (data?.lockOwner === deviceId) {
+                    logger.info(`Clearing abandoned lock on ${collectionId}/${docId}`);
+                    transaction.update(docRef, { processingBefore: null, lockOwner: null });
+                } else {
+                    logger.info(`Lock on ${collectionId}/${docId} is owned by ${data?.lockOwner}, not clearing.`);
+                }
+            });
+        } catch (error) {
+            logger.error(`Error clearing lock for ${docId}:`, error);
         }
     }
 );

@@ -27,9 +27,11 @@ Runs in background, handles all communications. Designed to run on device or in 
 */
 
 
-import { communicationsCollection, contactsCollection, getMessageListener, getUserId, qualiaDocOperationsCollection, qualiaDocsCollection } from "./firebase";
+import { communicationsCollection, contactsCollection, getMessageListener, getUserId, qualiaDocOperationsCollection, qualiaDocsCollection, runWithLock, getTimeToWait, waitForLockRelease } from "./firebase";
 import { getContacts, getQualia } from "./firebaseClientUtils";
-import { ai, db } from "./firebaseAuth";
+import { ai, db, rtdb, installations } from "./firebaseAuth";
+import { ref as databaseRef, set, remove, onDisconnect } from "firebase/database";
+import { getId } from "firebase/installations";
 import { BASE_QUALIA } from "./constants";
 import { RateLimiter, withRetry } from "./requestUtils";
 
@@ -79,11 +81,7 @@ const MAX_COMPACTION_PROCESSING_SECONDS = 1200;
 const NETWORK_DELAY_SECONDS = 2;
 const COMPACTION_PROCESSING_SECONDS = 600;
 
-function getTimeToWait(processingBefore: number) {
-    const waitTime = processingBefore - Date.now() + NETWORK_DELAY_SECONDS * 1e3;
-    const isValidProcessingBefore = waitTime > 0 && waitTime < MAX_COMPACTION_PROCESSING_SECONDS * 1e3;
-    return isValidProcessingBefore ? waitTime : 0;
-}
+
 
 /*
 Keeps the same qualia doc id and just updates the content. Creates 
@@ -180,53 +178,56 @@ async function qualiaCompaction(qualiaDocRef: DocumentReference): Promise<Docume
     let processingBefore: Timestamp | undefined;
     let timeToWait = 0;
 
-    const claimed = await runTransaction(db, async (transaction) => {
-        const docSnap = await transaction.get(qualiaDocRef);
-        if (!docSnap.exists()) {
-            throw new Error("Qualia doc does not exist for compaction");
-        }
-        const data = docSnap.data() as QualiaDoc;
+    // Check if nextQualiaDocId exists or if locked (without claiming yet, to get wait time)
+    // Actually runWithLock checkFn runs inside transaction.
+    // But we need to return nextDocRef if it exists.
+    // And we need to wait if locked.
 
-        if (data.nextQualiaDocId) {
-            nextDocRef = doc(await qualiaDocsCollection(), data.nextQualiaDocId);
-            return false;
-        }
-
-        if (data.processingBefore) {
-            timeToWait = getTimeToWait(data.processingBefore.toMillis());
-            if (timeToWait > 0) {
-                processingBefore = data.processingBefore; // Capture the timestamp
+    // Let's try to claim.
+    const result = await runWithLock(
+        qualiaDocRef,
+        async (lock) => {
+            try {
+                const newQualiaDocRef = await performCompaction(qualiaDocRef);
+                console.log(`Compaction complete. Existing doc ${qualiaDocRef.id} updated with new content.`);
+                return newQualiaDocRef;
+            } catch (error) {
+                console.error(`Error during qualia compaction: ${qualiaDocRef.id} : ${error}`);
+                throw error;
+            }
+        },
+        COMPACTION_PROCESSING_SECONDS,
+        (data) => {
+            if (data.nextQualiaDocId) {
                 return false;
             }
+            return true;
         }
+    );
 
-        transaction.update(qualiaDocRef, { processingBefore: Timestamp.fromMillis(Date.now() + COMPACTION_PROCESSING_SECONDS * 1e3) });
-        return true;
-    });
+    if (result) return result;
 
-    if (nextDocRef) {
-        return nextDocRef;
+    // If we are here, we couldn't claim. Check why.
+    const docSnap = await getDoc(qualiaDocRef);
+    if (!docSnap.exists()) throw new Error("Qualia doc does not exist");
+    const data = docSnap.data() as QualiaDoc;
+
+    if (data.nextQualiaDocId) {
+        return doc(await qualiaDocsCollection(), data.nextQualiaDocId);
     }
 
-    if (claimed) {
-        console.log(`Claimed ${qualiaDocRef.id} for compaction.`);
-        try {
-            // withRetry is important for network errors during compaction
-            const newQualiaDocRef = await performCompaction(qualiaDocRef);
-            console.log(`Compaction complete. Existing doc ${qualiaDocRef.id} updated with new content.`);
-            return newQualiaDocRef;
-        } catch (error) {
-            console.error(`Error during qualia compaction: ${qualiaDocRef.id} : ${error}`);
-            throw error;
+    if (data.processingBefore) {
+        timeToWait = getTimeToWait(data.processingBefore.toMillis(), MAX_COMPACTION_PROCESSING_SECONDS);
+        if (timeToWait > 0) {
+            console.log(`Another client is compacting ${qualiaDocRef.id}, waiting for ${timeToWait}ms`);
+            await waitForLockRelease(qualiaDocRef, timeToWait);
+            return qualiaCompaction(qualiaDocRef);
         }
     }
 
-    if (processingBefore) {
-        console.log(`Another client is compacting ${qualiaDocRef.id}, waiting for ${timeToWait}ms`);
-        return await new Promise(resolve => setTimeout(resolve, timeToWait)).then(() => qualiaCompaction(qualiaDocRef));
-    }
-
-    throw new Error(`Unable to claim ${qualiaDocRef.id} for compaction`);
+    // If we are here, it wasn't locked (or lock expired) and no nextDoc, but runWithLock failed?
+    // Maybe race condition. Retry.
+    return qualiaCompaction(qualiaDocRef);
 }
 
 /*
@@ -452,115 +453,111 @@ async function markCommunicationsAsAcked(communications: Communication[]) {
 
 async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: string) {
     console.log("Attemping integration");
-    const claimed = await runTransaction(db, async (transaction) => {
-        console.log("starting transaction");
-        const docSnap = await transaction.get(qualiaDocRef);
-        console.log("got ", { docSnap });
-        if (!docSnap.exists()) return false;
-        const data = docSnap.data() as QualiaDoc;
+    async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: string) {
+        console.log("Attemping integration");
 
-        if (data.processingBefore && getTimeToWait(data.processingBefore.toMillis()) > 0) {
-            console.log("locked");
-            return false; // Locked
-        }
+        const result = await runWithLock(
+            qualiaDocRef,
+            async (lock) => {
+                console.log(`Integration started for qualia ${qualiaId}`);
+                try {
+                    // Fetch fresh data
+                    const docSnap = await getDoc(qualiaDocRef);
+                    let qualiaDoc = docSnap.data() as QualiaDoc;
 
-        transaction.update(qualiaDocRef, { processingBefore: Timestamp.fromMillis(Date.now() + COMPACTION_PROCESSING_SECONDS * 1e3) });
-        console.log("locked")
-        return true;
-    });
+                    // Fetch pending communications
+                    const pendingCommunications = await getPendingCommunications(qualiaId);
 
-    if (!claimed) return;
-
-    console.log(`Integration started for qualia ${qualiaId}`);
-
-    try {
-        // Fetch fresh data
-        const docSnap = await getDoc(qualiaDocRef);
-        let qualiaDoc = docSnap.data() as QualiaDoc;
-
-        // Fetch pending communications
-        const pendingCommunications = await getPendingCommunications(qualiaId);
-
-        // Skip if no pending communications and graph is empty
-        if (pendingCommunications.length === 0 && Object.keys(qualiaDoc.nodes || {}).length === 0) {
-            console.log('No pending communications and empty graph - skipping integration');
-            return;
-        }
-
-        let errorInfo: string | undefined;
-        let newDoc: QualiaDoc | undefined;
-
-        // Retry loop (only for operation errors, not base graph corruption)
-        let lastOperations: IntegrationOperation[] | undefined;
-        while (true) {
-            try {
-                const integrationResult = await integrateCommunications(qualiaDoc, pendingCommunications, errorInfo);
-                lastOperations = integrationResult.operations;
-                newDoc = applyOperations(qualiaDoc, integrationResult.operations);
-
-                const cycles = detectCycles(newDoc);
-                if (cycles) {
-                    errorInfo = `Cycle detected: ${JSON.stringify(cycles)}. Please retry without creating cycles.`;
-                    if (lastOperations) {
-                        errorInfo += `\nAttempted operations: ${JSON.stringify(lastOperations)}`;
+                    // Skip if no pending communications and graph is empty
+                    if (pendingCommunications.length === 0 && Object.keys(qualiaDoc.nodes || {}).length === 0) {
+                        console.log('No pending communications and empty graph - skipping integration');
+                        // Lock will be auto-released
+                        return;
                     }
-                    console.log(errorInfo);
-                    continue;
-                }
 
-                // Success
-                break;
-            } catch (e) {
-                // Base graph corruption - fail permanently, don't retry
-                if (e instanceof BaseGraphCorruptionError) {
-                    console.error("Base graph corruption detected:", e.message);
-                    await updateDoc(qualiaDocRef, { processingBefore: null });
-                    throw e; // Propagate to caller/UI
+                    let errorInfo: string | undefined;
+                    let newDoc: QualiaDoc | undefined;
+
+                    // Retry loop (only for operation errors, not base graph corruption)
+                    let lastOperations: IntegrationOperation[] | undefined;
+                    while (true) {
+                        try {
+                            const integrationResult = await integrateCommunications(qualiaDoc, pendingCommunications, errorInfo);
+                            lastOperations = integrationResult.operations;
+                            newDoc = applyOperations(qualiaDoc, integrationResult.operations);
+
+                            const cycles = detectCycles(newDoc);
+                            if (cycles) {
+                                errorInfo = `Cycle detected: ${JSON.stringify(cycles)}. Please retry without creating cycles.`;
+                                if (lastOperations) {
+                                    errorInfo += `\nAttempted operations: ${JSON.stringify(lastOperations)}`;
+                                }
+                                console.log(errorInfo);
+                                continue;
+                            }
+
+                            // Success
+                            break;
+                        } catch (e) {
+                            // Base graph corruption - fail permanently, don't retry
+                            if (e instanceof BaseGraphCorruptionError) {
+                                console.error("Base graph corruption detected:", e.message);
+                                throw e; // Propagate to caller/UI
+                            }
+                            // Operation validation errors - retry with context
+                            if (e instanceof GraphValidationError) {
+                                errorInfo = e.message;
+                                console.log(errorInfo);
+                                continue;
+                            }
+                            throw e;
+                        }
+                    }
+
+                    // Success. Create new doc and link from old.
+                    const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), {
+                        ...newDoc!,
+                        nextQualiaDocId: "",
+                        processingBefore: null,
+                        createdTime: Timestamp.now()
+                    });
+
+                    await updateDoc(qualiaDocRef, {
+                        nextQualiaDocId: newQualiaDocRef.id,
+                        // processingBefore will be cleared by runWithLock auto-release, but setting nextQualiaDocId is the key here.
+                        // Actually, if we set nextQualiaDocId, processingBefore is irrelevant.
+                        // But runWithLock will try to clear processingBefore.
+                        // That's fine.
+                    });
+
+                    console.log(`Created new qualia doc: ${newQualiaDocRef.id} from integration`);
+
+                    // Store operations record
+                    await addDoc(await qualiaDocOperationsCollection(), {
+                        qualiaId: qualiaId,
+                        qualiaDocId: newQualiaDocRef.id,
+                        operations: lastOperations!,
+                        communicationIds: pendingCommunications.map(c => c.id).filter((id): id is string => !!id),
+                        createdTime: Timestamp.now()
+                    });
+
+                    // Mark communications as acked
+                    await markCommunicationsAsAcked(pendingCommunications);
+
+                    console.log("Integration successful.");
+
+                } catch (e) {
+                    console.error("Error during integration:", e);
+                    throw e;
                 }
-                // Operation validation errors - retry with context
-                if (e instanceof GraphValidationError) {
-                    errorInfo = e.message;
-                    console.log(errorInfo);
-                    continue;
-                }
-                throw e;
-            }
+            },
+            COMPACTION_PROCESSING_SECONDS
+        );
+
+        if (result === undefined) {
+            // Could not claim lock
+            console.log("Could not claim lock for integration");
         }
-
-        // Success. Create new doc and link from old.
-        const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), {
-            ...newDoc!,
-            nextQualiaDocId: "",
-            processingBefore: null,
-            createdTime: Timestamp.now()
-        });
-
-        await updateDoc(qualiaDocRef, {
-            nextQualiaDocId: newQualiaDocRef.id,
-            processingBefore: null
-        });
-
-        console.log(`Created new qualia doc: ${newQualiaDocRef.id} from integration`);
-
-        // Store operations record
-        await addDoc(await qualiaDocOperationsCollection(), {
-            qualiaId: qualiaId,
-            qualiaDocId: newQualiaDocRef.id,
-            operations: lastOperations!,
-            communicationIds: pendingCommunications.map(c => c.id).filter((id): id is string => !!id),
-            createdTime: Timestamp.now()
-        });
-
-        // Mark communications as acked
-        await markCommunicationsAsAcked(pendingCommunications);
-
-        console.log("Integration successful.");
-
-    } catch (e) {
-        console.error("Error during integration:", e);
-        // Release lock?
-        await updateDoc(qualiaDocRef, { processingBefore: null });
-        throw e;
     }
 }
 
@@ -663,3 +660,4 @@ async function getQualiaDoc(qualiaId: string): Promise<DocumentReference> {
     }
     return docs[0].ref;
 }
+
