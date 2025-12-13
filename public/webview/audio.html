@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <!-- Parallel mobile implementation in audioSession.ts -->
 <html>
+
 <head>
     <title>Audio Session</title>
     <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
@@ -8,6 +9,7 @@
     <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-ai-compat.js"></script>
 </head>
+
 <body>
     <script>
         // This script is self-contained and runs inside the native WebView.
@@ -18,9 +20,10 @@
 
         let liveSession;
 
-        async function startAudioConversation() {
+        async function startAudioConversation(systemInstruction) {
             const model = ai.getLiveGenerativeModel({
                 model: "gemini-live-2.5-flash-preview",
+                systemInstruction: systemInstruction,
                 generationConfig: {
                     inputAudioTranscription: {},
                     outputAudioTranscription: {},
@@ -98,14 +101,31 @@
         }
 
         window.addEventListener('message', event => {
-            if (event.data === 'start') {
-                startAudioConversation();
-            } else if (event.data === 'stop') {
-                if (liveSession) {
-                    liveSession.close();
+            try {
+                // Handle both string and object messages
+                const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+
+                if (data.type === 'start') {
+                    startAudioConversation(data.systemInstruction);
+                } else if (data === 'start') { // Legacy support just in case
+                    startAudioConversation();
+                } else if (data === 'stop' || data.type === 'stop') {
+                    if (liveSession) {
+                        liveSession.close();
+                    }
+                }
+            } catch (e) {
+                // If JSON parse fails, check if it's a simple string command
+                if (event.data === 'start') {
+                    startAudioConversation();
+                } else if (event.data === 'stop') {
+                    if (liveSession) {
+                        liveSession.close();
+                    }
                 }
             }
         });
     </script>
 </body>
+
 </html>

@@ -1,4 +1,4 @@
-import { addDoc, query, where, getDocs, Timestamp, runTransaction, doc, orderBy, limit } from "firebase/firestore";
+import { addDoc, query, where, getDocs, Timestamp, runTransaction, doc, orderBy, limit, or } from "firebase/firestore";
 import { getUserId, communicationsCollection, contactsCollection, getMessageListener, qualiaCollection } from "./firebase";
 import { Communication, Contact, Contacts, ContextQualia, Qualia } from "./types";
 import { db } from "./firebaseAuth";
@@ -20,7 +20,7 @@ export async function sendMessage({ message, contextQualia, toQualia }: { messag
     context: `While talking to ${contextQualia.name} (id: ${contextQualia.id})`,
     toQualiaId: toQualia.id,
     deliveryTime: Timestamp.now(),
-    communicationType: "HUMAN_TO_QUALIA",
+    communicationType: userId === toQualia.id ? "HUMAN_TO_QUALIA" : "HUMAN_TO_HUMAN",
     ack: false,
     seen: false,
   };
@@ -29,7 +29,7 @@ export async function sendMessage({ message, contextQualia, toQualia }: { messag
 }
 
 export async function registerClientMessageClb(callback: (communication: Communication) => Promise<void>) {
-  return getMessageListener(await getUserId(), await communicationsCollection(), where("communicationType", "==", "QUALIA_TO_HUMAN"), callback, false, "seen");
+  return getMessageListener(await getUserId(), await communicationsCollection(), or(where("fromQualiaId", "!=", await getUserId()), where("communicationType", "==", "QUALIA_TO_HUMAN")), callback, false, "seen");
 }
 
 export async function getContacts(): Promise<Contact[]> {

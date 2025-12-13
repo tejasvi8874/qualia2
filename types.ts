@@ -1,7 +1,7 @@
 import { Schema } from "firebase/ai";
 import { Timestamp } from "firebase/firestore";
 
-export type CommunicationType = "HUMAN_TO_QUALIA" | "QUALIA_TO_HUMAN" | "QUALIA_TO_QUALIA";
+export type CommunicationType = "HUMAN_TO_QUALIA" | "QUALIA_TO_HUMAN" | "QUALIA_TO_QUALIA" | "HUMAN_TO_HUMAN";
 
 
 export interface Contact {
@@ -54,7 +54,7 @@ export const COMMUNICATION_SCHEMA = Schema.object({
           toQualiaName: Schema.string(),
           fromQualiaName: Schema.string(),
           communicationType: Schema.enumString({
-            enum: ["HUMAN_TO_QUALIA", "QUALIA_TO_HUMAN", "QUALIA_TO_QUALIA"],
+            enum: ["QUALIA_TO_HUMAN", "QUALIA_TO_QUALIA"],
           }),
           isNewQualia: Schema.boolean(),
           money: Schema.number(),
@@ -122,7 +122,7 @@ export const INTEGRATION_SCHEMA = Schema.object({
           createId: Schema.string({ description: "Unique ID for the new conclusion. Required for CREATE." }),
           conclusion: Schema.string({ description: "The content of the new conclusion. Required for CREATE." }),
           assumptions: Schema.array({ items: Schema.string(), description: "List of IDs of existing conclusions to be used as assumptions for the new conclusion. Required for CREATE." }),
-          deleteIds: Schema.array({ items: Schema.string(), description: "List of IDs of conclusions to delete. Required for DELETE. Note: If an assumption is deleted, all its parent conclusions must also be deleted (and recreated with appropriate assumptions if needed)." }),
+          deleteIds: Schema.array({ items: Schema.string(), description: "List of IDs of conclusions to delete. Required for DELETE. Note: If an assumption is deleted, recursively all its parent conclusions must also be deleted till the root conclusion (recreated the updated conclusions with appropriate assumptions if needed)." }),
         },
         propertyOrdering: ["reasoning", "type", "createId", "conclusion", "assumptions", "deleteIds"],
         optionalProperties: ["reasoning", "createId", "conclusion", "assumptions", "deleteIds"],

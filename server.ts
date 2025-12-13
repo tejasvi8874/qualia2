@@ -9,8 +9,10 @@ import {
     getDoc,
     arrayUnion,
     runTransaction,
+    and,
     doc,
     onSnapshot,
+    or,
 } from "firebase/firestore";
 import { getGenerativeModel, HarmBlockThreshold, HarmCategory, ObjectSchema, GenerativeModel } from "firebase/ai";
 
@@ -46,7 +48,7 @@ import { BASE_QUALIA } from "./constants";
 import { RateLimiter, withRetry } from "./requestUtils";
 
 export async function messageListener() {
-    return getMessageListener(await getUserId(), await communicationsCollection(), where("communicationType", "!=", "QUALIA_TO_HUMAN"), messageHandler, true, "seen");
+    return getMessageListener(await getUserId(), await communicationsCollection(), or(where("fromQualiaId", "!=", await getUserId()), where("communicationType", "!=", "QUALIA_TO_HUMAN")), messageHandler, true, "seen");
 }
 
 const safetySettings = Object.values(HarmCategory).map((category) => ({ category, threshold: HarmBlockThreshold.BLOCK_NONE }));
@@ -132,7 +134,7 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
         // Retry loop for validation/cycles
         while (true) {
             try {
-                const currentPrompt = errorInfo ? prompt + `\n\nPrevious attempt failed: ${errorInfo}` : prompt;
+                const currentPrompt = errorInfo ? prompt + `\n\nPrevious attempt failed:\n\n${errorInfo}` : prompt;
                 const result = await generateContentNonStreaming(integrationModel, currentPrompt);
                 ops = JSON.parse(result.response.text()) as IntegrationResponse;
 
@@ -157,7 +159,7 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
                 }
                 // Operation validation errors - retry with context
                 if (e instanceof GraphValidationError) {
-                    errorInfo = `Validation failed: ${e.message}. Ensure all referred IDs exist.`;
+                    errorInfo = e.message;
                     console.log(errorInfo);
                     continue;
                 }
@@ -465,15 +467,19 @@ async function markCommunicationsAsAcked(communications: Communication[]) {
 async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: string) {
     console.log("Attemping integration");
     const claimed = await runTransaction(db, async (transaction) => {
+        console.log("starting transaction");
         const docSnap = await transaction.get(qualiaDocRef);
+        console.log("got ", { docSnap });
         if (!docSnap.exists()) return false;
         const data = docSnap.data() as QualiaDoc;
 
         if (data.processingBefore && getTimeToWait(data.processingBefore.toMillis()) > 0) {
+            console.log("locked");
             return false; // Locked
         }
 
         transaction.update(qualiaDocRef, { processingBefore: Timestamp.fromMillis(Date.now() + COMPACTION_PROCESSING_SECONDS * 1e3) });
+        console.log("locked")
         return true;
     });
 
@@ -527,10 +533,7 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
                 }
                 // Operation validation errors - retry with context
                 if (e instanceof GraphValidationError) {
-                    errorInfo = `Validation failed: "${e.message}". Ensure a conclusion with that ID exist before specifying it as an assumption.`;
-                    if (lastOperations) {
-                        errorInfo += `\nAttempted operations: ${JSON.stringify(lastOperations)}`;
-                    }
+                    errorInfo = e.message;
                     console.log(errorInfo);
                     continue;
                 }
@@ -580,29 +583,10 @@ async function getValidCommunication(communication: Communication): Promise<Comm
     let errorMessage = "";
     communication.communicationType = communication.communicationType.trim() as Communication["communicationType"];
     if (communication.communicationType === "QUALIA_TO_HUMAN") {
-        if (communication.fromQualiaId === undefined) {
-            communication.fromQualiaId = await getUserId();
-        } else if (communication.fromQualiaId !== await getUserId()) {
-            // Sending message on some other qualia's behalf
-            const contacts = await getContacts();
-            const contact = contacts.find((contact) => contact.qualiaId === communication.fromQualiaId);
-            if (!contact) {
-                errorMessage += `The fromQualiaId for QUALIA_TO_HUMAN: ${communication.fromQualiaId} was not found in any of the previous communications. Your qualiaId is ${await getUserId()}. To send communication to your human counterpart on some other qualia's behalf, there must be atleast one communication with the other qualia to prevents incorrect qualia ID issues.\n`;
-            } else if (!communication.fromQualiaName) {
-                communication.fromQualiaName = contact.names[0];
-            }
-        }
         if (communication.toQualiaId === undefined) {
             communication.toQualiaId = await getUserId();
-        } else if (communication.toQualiaId !== await getUserId()) {
-            errorMessage += `Invalid toQualiaId for QUALIA_TO_HUMAN: ${communication.toQualiaId}. Your qualiaId is ${await getUserId()}.\n`;
         }
     } else if (communication.communicationType === "QUALIA_TO_QUALIA") {
-        if (communication.fromQualiaId === undefined) {
-            communication.fromQualiaId = await getUserId();
-        } else if (communication.fromQualiaId !== await getUserId()) {
-            errorMessage += `Invalid fromQualiaId for QUALIA_TO_QUALIA: ${communication.fromQualiaId}. Your qualiaId is ${await getUserId()}.\n`;
-        }
         if (communication.toQualiaId === undefined) {
             if (communication.toQualiaName) {
                 const qualiaIds = getContacts().then(
