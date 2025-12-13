@@ -209,8 +209,8 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
             const id = op.createId;
 
             // Check for collision with existing nodes
-            if (doc.nodes[id]) {
-                const existingNode = doc.nodes[id];
+            if (newDoc.nodes[id]) {
+                const existingNode = newDoc.nodes[id];
                 errors.push(
                     `CREATE operation failed: Conclusion with ID ${id} already exists. Existing conclusion content: ${existingNode.conclusion}`
                 );
@@ -235,12 +235,12 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
             newDoc.nodes[newNode.id] = newNode;
             createdNodeIds.add(newNode.id);
         } else if (op.type === "DELETE") {
-            if (!op.deleteIds || op.deleteIds.length === 0) {
-                errors.push(`DELETE operation missing deleteIds`);
+            if (!op.deleteIdsPathTillRoot || op.deleteIdsPathTillRoot.length === 0) {
+                errors.push(`DELETE operation missing deleteIdsPathTillRoot`);
                 continue;
             }
 
-            for (const idToDelete of op.deleteIds) {
+            for (const idToDelete of op.deleteIdsPathTillRoot) {
                 if (!newDoc.nodes[idToDelete]) {
                     errors.push(`DELETE operation refers to non-existent ID: ${idToDelete}`);
                     continue;
@@ -256,8 +256,10 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
         for (const assumptionId of node.assumptionIds) {
             if (!newDoc.nodes[assumptionId]) {
                 // This catches the case where we deleted an assumption but didn't delete the parent.
+                const ancestors = getAllAncestors(newDoc.nodes, node.id);
+                const idsToDelete = [node.id, ...ancestors];
                 errors.push(
-                    `Conclusion ${node.id} refers to missing assumption ${assumptionId}. If you removed the assumption ${assumptionId}, you must also remove its parent conclusion ${node.id}.`
+                    `Conclusion ${node.id} refers to missing assumption ${assumptionId}. You must also remove its parent conclusion ${node.id} and all its ancestor conclusions. Therefore all the IDs in [${idsToDelete.join(", ")}] have to be deleted and created anew if required.`
                 );
             }
         }
@@ -318,4 +320,29 @@ export function detectCycles(doc: QualiaDoc): string[] | null {
     }
 
     return null;
+}
+
+function getAllAncestors(nodes: Record<string, QualiaNode>, startId: string): string[] {
+    const parentMap: Record<string, string[]> = {};
+    // Build parent map (child -> parents)
+    for (const node of Object.values(nodes)) {
+        for (const childId of node.assumptionIds) {
+            if (!parentMap[childId]) parentMap[childId] = [];
+            parentMap[childId].push(node.id);
+        }
+    }
+
+    const ancestors = new Set<string>();
+    const queue = [startId];
+    while (queue.length > 0) {
+        const current = queue.shift()!;
+        const parents = parentMap[current] || [];
+        for (const p of parents) {
+            if (!ancestors.has(p)) {
+                ancestors.add(p);
+                queue.push(p);
+            }
+        }
+    }
+    return Array.from(ancestors);
 }

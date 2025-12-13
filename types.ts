@@ -144,10 +144,10 @@ export const INTEGRATION_SCHEMA = Schema.object({
           createId: Schema.string({ description: "Unique ID for the new conclusion. Required for CREATE." }),
           conclusion: Schema.string({ description: "The content of the new conclusion. Required for CREATE." }),
           assumptions: Schema.array({ items: Schema.string(), description: "List of IDs of existing conclusions to be used as assumptions for the new conclusion. Required for CREATE." }),
-          deleteIds: Schema.array({ items: Schema.string(), description: "List of IDs of conclusions to delete. Required for DELETE. Note: If an assumption is deleted, recursively all its parent conclusions must also be deleted till the root conclusion (recreated the updated conclusions with appropriate assumptions if needed)." }),
+          deleteIdsPathTillRoot: Schema.array({ items: Schema.string(), description: "Path of conclusion IDs to delete which must include root conclusion. Required for DELETE. If an assumption or conclusion is deleted, recursively all its parent conclusions must also be deleted till the root conclusion. Recreate the updated conclusions with appropriate assumptions if needed." }),
         },
-        propertyOrdering: ["reasoning", "type", "createId", "conclusion", "assumptions", "deleteIds"],
-        optionalProperties: ["reasoning", "createId", "conclusion", "assumptions", "deleteIds"],
+        propertyOrdering: ["reasoning", "type", "createId", "conclusion", "assumptions", "deleteIdsPathTillRoot"],
+        optionalProperties: ["reasoning", "createId", "conclusion", "assumptions", "deleteIdsPathTillRoot"],
       }),
     }),
   },
@@ -161,7 +161,7 @@ export interface IntegrationOperation {
   createId?: string;
   conclusion?: string;
   assumptions?: string[];
-  deleteIds?: string[];
+  deleteIdsPathTillRoot?: string[];
 }
 
 export interface IntegrationResponse {
