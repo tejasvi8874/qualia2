@@ -17,6 +17,7 @@ import {
   useColorScheme,
   Modal,
   Keyboard,
+  Animated,
 } from "react-native";
 // Import SafeAreaProvider to use in the root and within the Modal
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
@@ -96,6 +97,8 @@ const FONT_FAMILY = Platform.select({
 });
 
 const FONT_SIZE = 18;
+
+const HIT_SLOP = { top: 20, bottom: 20, left: 20, right: 20 };
 
 type LocalColorScheme = "light" | "dark" | "no-preference" | null | undefined;
 
@@ -280,10 +283,10 @@ const QualiaSwitcher = ({
         <>
           <View style={styles.switcherHeader}>
             <Text style={[styles.switcherButtonText, { flex: 1, color: theme.text, fontWeight: 'bold' }]}>Debug Logs</Text>
-            <TouchableOpacity onPress={() => setView('list')} style={styles.switcherButton}>
+            <TouchableOpacity onPress={() => setView('list')} style={styles.switcherButton} hitSlop={HIT_SLOP}>
               <Text style={[styles.switcherButtonText, { color: theme.dimText }]}>Back</Text>
             </TouchableOpacity>
-            <TouchableOpacity onPress={onClose} style={styles.switcherButton}>
+            <TouchableOpacity onPress={onClose} style={styles.switcherButton} hitSlop={HIT_SLOP}>
               <Text style={[styles.switcherButtonText, { color: theme.dimText }]}>Close</Text>
             </TouchableOpacity>
           </View>
@@ -335,6 +338,7 @@ const QualiaSwitcher = ({
             onPress={handleCreate}
             style={styles.switcherButton}
             disabled={!canCreate}
+            hitSlop={HIT_SLOP}
           >
             <Text
               style={[
@@ -345,7 +349,7 @@ const QualiaSwitcher = ({
               Create
             </Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={onClose} style={styles.switcherButton}>
+          <TouchableOpacity onPress={onClose} style={styles.switcherButton} hitSlop={HIT_SLOP}>
             <Text
               style={[styles.switcherButtonText, { color: theme.dimText }]}
             >
@@ -373,13 +377,13 @@ const QualiaSwitcher = ({
           />
         </View>
         {Platform.OS === 'web' && isDebugEnabled && (
-          <TouchableOpacity onPress={() => setView('debug')} style={styles.signOutButton}>
+          <TouchableOpacity onPress={() => setView('debug')} style={styles.signOutButton} hitSlop={HIT_SLOP}>
             <Text style={[styles.switcherButtonText, { color: theme.dimText, fontSize: 14 }]}>
               Debug Mode
             </Text>
           </TouchableOpacity>
         )}
-        <TouchableOpacity onPress={onSignOut} style={styles.signOutButton}>
+        <TouchableOpacity onPress={onSignOut} style={styles.signOutButton} hitSlop={HIT_SLOP}>
           <Text style={[styles.switcherButtonText, { color: theme.dimText }]}>
             Logout
           </Text>
@@ -520,6 +524,44 @@ const AppContent = () => {
   const [isRecaptchaVisible, setIsRecaptchaVisible] = useState(false);
   const [isSendingCode, setIsSendingCode] = useState(false);
   const [viewportHeight, setViewportHeight] = useState<number | string>(Platform.OS === 'web' ? '100%' : '100%');
+  const sendButtonOpacity = useRef(new Animated.Value(0)).current;
+  const targetOpacity = useRef(0);
+
+  useEffect(() => {
+    // Logic: 
+    // - Show if !userId && web && !confirmationResult && !isSendingCode && len >= 4
+    // - Debounce: if user modifies, only debounce if we are NOT already visible.
+    // - If already visible, stay visible.
+
+    const shouldShow = !userId && Platform.OS === 'web' && !confirmationResult && !isSendingCode && inputText.length >= 4;
+
+    if (shouldShow) {
+      if (targetOpacity.current === 1) {
+        // Already visible, do nothing/ensure it stays 1
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        targetOpacity.current = 1;
+        Animated.timing(sendButtonOpacity, {
+          toValue: 1,
+          duration: 100,
+          useNativeDriver: true,
+        }).start();
+      }, 500);
+      return () => clearTimeout(timer);
+    } else {
+      // Hide immediately
+      if (targetOpacity.current !== 0) {
+        targetOpacity.current = 0;
+        Animated.timing(sendButtonOpacity, {
+          toValue: 0,
+          duration: 100,
+          useNativeDriver: true,
+        }).start();
+      }
+    }
+  }, [inputText, userId, confirmationResult, isSendingCode]);
 
   // Inject global CSS for web to fix autocomplete background color and viewport meta
   useEffect(() => {
@@ -1447,6 +1489,7 @@ Current Timestamp: ${new Date().toString()}`;
               }
             }}
             disabled={!userQualia}
+            hitSlop={HIT_SLOP}
           >
             {/* Dim the text slightly when disabled for better UX */}
             <Text
@@ -1459,7 +1502,7 @@ Current Timestamp: ${new Date().toString()}`;
             </Text>
           </TouchableOpacity>
           {userQualia && (
-            <TouchableOpacity onPress={handleCall}>
+            <TouchableOpacity onPress={handleCall} hitSlop={HIT_SLOP}>
               <Text style={[styles.headerTitle, { color: theme.text }]}>
                 {isCalling ? "End" : isCallConnecting ? "Calling" : "Call"}
               </Text>
@@ -1473,7 +1516,7 @@ Current Timestamp: ${new Date().toString()}`;
             <Text style={[styles.errorText, { color: '#ffffff' }]}>
               Graph Error: {graphError}
             </Text>
-            <TouchableOpacity onPress={() => setGraphError(null)} style={styles.errorDismiss}>
+            <TouchableOpacity onPress={() => setGraphError(null)} style={styles.errorDismiss} hitSlop={HIT_SLOP}>
               <Text style={{ color: '#ffffff', fontSize: 18, fontWeight: 'bold' }}>×</Text>
             </TouchableOpacity>
           </View>
@@ -1563,22 +1606,27 @@ Current Timestamp: ${new Date().toString()}`;
             returnKeyType={!userId ? "done" : "default"}
             onSubmitEditing={!userId ? handleAuthSubmit : undefined}
           />
-          {!userId && Platform.OS === 'web' && (
-            <TouchableOpacity
-              onPress={handleAuthSubmit}
-              style={[styles.modeToggle, { alignSelf: 'flex-start', paddingTop: 4 }]}
-            >
-              <Text style={[styles.modeToggleText, { color: theme.text, fontStyle: 'normal', fontSize: 20 }]}>
-                Send
-              </Text>
-            </TouchableOpacity>
+          {!userId && Platform.OS === 'web' && !confirmationResult && !isSendingCode && (
+            <Animated.View style={{ opacity: sendButtonOpacity, marginLeft: 15, alignSelf: 'flex-start' }}>
+              <TouchableOpacity
+                onPress={handleAuthSubmit}
+                style={{ paddingTop: 4, paddingBottom: 4 }}
+                hitSlop={HIT_SLOP}
+              >
+                <Text style={[styles.modeToggleText, { color: theme.text, fontStyle: 'normal', fontSize: FONT_SIZE }]}>
+                  Send
+                </Text>
+              </TouchableOpacity>
+            </Animated.View>
           )}
+
           {/* Requirement: Don't show thinking/speaking toggle when talking to own qualia. 
               Also hide until userQualia is established. */}
           {userQualia && !isTalkingToSelf && (
             <TouchableOpacity
               onPress={toggleMode}
               style={styles.modeToggle}
+              hitSlop={HIT_SLOP}
               // Prevent keyboard dismissal on iOS when tapping the button
               onPressIn={
                 Platform.OS === "ios" ? (e) => e.preventDefault() : undefined
