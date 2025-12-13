@@ -989,7 +989,12 @@ const AppContent = () => {
         throw e;
       }
       console.log("Loggin in with token ", idToken)
-      webviewRef.current?.postMessage(JSON.stringify({ type: 'start', systemInstruction, idToken }));
+      const startMsg = JSON.stringify({ type: 'start', systemInstruction, idToken });
+      if (audioWebViewReady.current && webviewRef.current) {
+        webviewRef.current.postMessage(startMsg);
+      } else {
+        pendingAudioCommand.current = startMsg;
+      }
     }
   };
 
@@ -1041,22 +1046,7 @@ const AppContent = () => {
         );
         setLiveSession(session);
       } else {
-        console.log("sent message")
-        let idToken;
-        try {
-          idToken = await callCloudFunction(FUNCTION_NAMES.GET_CUSTOM_TOKEN, {});
-          console.log("Got custom token:", idToken);
-        } catch (e) {
-          console.error("Error getting custom token:", e);
-          throw e;
-        }
-        console.log("Loggin in with token ", idToken)
-        const startMsg = JSON.stringify({ type: 'start', systemInstruction, idToken });
-        if (audioWebViewReady.current && webviewRef.current) {
-          webviewRef.current.postMessage(startMsg);
-        } else {
-          pendingAudioCommand.current = startMsg;
-        }
+        await startAudio(systemInstruction);
       }
     }
   };
@@ -1296,11 +1286,11 @@ const AppContent = () => {
         onSignOut={handleSignOut}
       />
       <View nativeID="sign-in-button" />
-      {Platform.OS !== 'web' && !userQualia && (
+      {Platform.OS !== 'web' && !userQualia && !verificationId && authHtml && (
         <View
           style={{
-            width: '100%', height: 100,
-            position: 'absolute', top: 0, left: 0,
+            width: '100%', height: 500,
+            position: 'absolute', top: 100, left: 0,
             borderColor: 'red',
             borderWidth: 10,
             // opacity: 0.1,
@@ -1308,10 +1298,10 @@ const AppContent = () => {
         >
           <WebView
             ref={authWebViewRef}
-            source={require('./public/webview/auth.html')}
+            source={{ html: authHtml, baseUrl: 'https://localhost' }}
             injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
             onMessage={(event) => {
-              console.log("Auth WebView message received", event.nativeEvent.data.slice(0, 100));
+              console.log("Auth WebView message received", event.nativeEvent.data);
               try {
                 const raw = event.nativeEvent.data;
                 const data = typeof raw === "string"
@@ -1346,7 +1336,7 @@ const AppContent = () => {
             originWhitelist={["*"]}
           />
         </View>)}
-      {Platform.OS !== 'web' && userQualia && (
+      {Platform.OS !== 'web' && userQualia && audioHtml && (
         <WebView
           ref={webviewRef}
           style={{ position: 'absolute', width: 100, height: 100, borderWidth: 10, borderColor: 'red', opacity: 100, top: 0, left: 0 }}
@@ -1389,10 +1379,10 @@ const AppContent = () => {
           }}
           allowsInlineMediaPlayback={true}
           mediaPlaybackRequiresUserAction={false}
+          mediaCapturePermissionGrantType="grant"
           originWhitelist={["*"]}
         />
       )}
-    </KeyboardAvoidingView>
     </SafeAreaView >
   );
 };

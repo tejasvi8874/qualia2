@@ -1,6 +1,5 @@
-import { getAuth, setPersistence, indexedDBLocalPersistence, browserLocalPersistence, signInWithPhoneNumber, RecaptchaVerifier, User, onAuthStateChanged, initializeAuth } from "firebase/auth";
-import { getReactNativePersistence } from 'firebase/auth';
-import ReactNativeAsyncStorage from '@react-native-async-storage/async-storage';
+import { getAuth, browserLocalPersistence, User, onAuthStateChanged, initializeAuth } from "firebase/auth";
+import { getReactNativePersistence } from "firebase/auth"
 import {
     getFirestore,
     persistentLocalCache,
@@ -12,14 +11,16 @@ import { getAI, GoogleAIBackend } from "firebase/ai";
 import { initializeApp } from "firebase/app";
 import { firebaseConfig } from "./firebaseConfig";
 import Constants from "expo-constants";
+import { isWeb } from "./platformUtils";
 
 const app = initializeApp(firebaseConfig);
 initializeFirestore(app, {
-    localCache: Constants.platform?.web
+    localCache: isWeb()
         ? persistentLocalCache({ tabManager: persistentMultipleTabManager() })
         : persistentLocalCache()
 });
-initializeAuth(app, { persistence: Constants.platform?.web ? browserLocalPersistence : getReactNativePersistence(ReactNativeAsyncStorage) });
+console.log({ Constants, p: Constants.platform, w: Constants.platform?.web });
+initializeAuth(app, { persistence: isWeb() ? browserLocalPersistence : getReactNativePersistence() });
 export const auth = getAuth(app);
 auth.useDeviceLanguage();
 

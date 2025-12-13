@@ -180,18 +180,3 @@ export interface ContextQualia {
   name: string;
   lastContactTime: Timestamp;
 }
-
-export interface FunctionResult {
-  value?: any;
-  error?: string;
-}
-
-
-export interface FunctionCall {
-  id?: string;
-  qualiaId: string;
-  functionName: FunctionName;
-  parameters: any;
-  result?: FunctionResult;
-  createTime?: Timestamp;
-}

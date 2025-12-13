@@ -58,19 +58,9 @@ async function getResponseCommunications(qualiaDoc: QualiaDoc, qualia: Qualia, c
     const prompt = `Generate new commmunications if required, keeping previous conversations in mind:\n${JSON.stringify({ myQualiaId: qualia.qualiaId, qualia: serializedQualia, money: qualia.money, communication: communication })}`;
     console.log(`Calling Gemini with prompt: ${prompt.substring(0, 100)}...`);
     const result = await communicationModel.generateContent(prompt);
-    const response = parseResult(result);
+    const response = JSON.parse(result.response.text());
     console.log(`Received response from Gemini: ${JSON.stringify(response)}`);
     return response;
-}
-
-function parseResult(result: { response: { text: () => string } }) {
-    const text = result.response.text();
-    try {
-        return JSON.parse(text);
-    } catch (error) {
-        console.error(`Error parsing integration response: ${text}`);
-        throw error;
-    }
 }
 
 async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunications: Communication[], errorInfo?: string): Promise<IntegrationResponse> {
@@ -81,7 +71,7 @@ async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunicatio
     }
     console.log(`Calling Gemini for integration with prompt length: ${prompt.length}`);
     const result = await integrationModel.generateContent(prompt);
-    return parseResult(result);
+    return JSON.parse(result.response.text());
 }
 
 
@@ -132,7 +122,7 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
             try {
                 const currentPrompt = errorInfo ? prompt + `\n\nPrevious attempt failed:\n\n${errorInfo}` : prompt;
                 const result = await integrationModel.generateContent(currentPrompt);
-                ops = parseResult(result) as IntegrationResponse;
+                ops = JSON.parse(result.response.text()) as IntegrationResponse;
 
                 const newDoc = applyOperations(qualiaDoc, ops.operations);
 

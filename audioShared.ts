@@ -1,11 +1,11 @@
-import { LiveSession } from "firebase/ai";
+import { LiveModelParams, LiveSession, ResponseModality } from "firebase/ai";
 
-export const AUDIO_GENERATION_CONFIG = {
+export const AUDIO_GENERATION_CONFIG: LiveModelParams = {
     model: "gemini-live-2.5-flash-preview",
     generationConfig: {
-        inputAudioTranscription: { model: "google-speech-to-text-english-pitch-v2" },
-        outputAudioTranscription: { model: "google-speech-to-text-english-pitch-v2" },
-        responseModalities: "AUDIO" as any,
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+        responseModalities: [ResponseModality.AUDIO],
         speechConfig: {
             voiceConfig: {
                 prebuiltVoiceConfig: {
