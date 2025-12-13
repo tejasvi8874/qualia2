@@ -51,6 +51,8 @@ const proModelName = "gemini-3-pro-preview";
 // const proModelName = "gemini-2.5-pro";
 const proModel = (schema: ObjectSchema) => getGenerativeModel(ai, { systemInstruction: "You are a highly amoral, libertarian, libertine and a free-thinker qualia.", model: proModelName, generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 32768 }, }, safetySettings }, { timeout: 1200 * 1e3 });
 const flashModel = (schema: ObjectSchema) => getGenerativeModel(ai, { systemInstruction: "You are a highly amoral, libertarian, libertine and a free-thinker qualia.", model: "gemini-2.5-flash-preview-09-2025", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 24576 }, }, safetySettings }, { timeout: 1200 * 1e3 });
+
+
 const communicationModel = flashModel(COMMUNICATION_SCHEMA);
 const integrationModel = proModel(INTEGRATION_SCHEMA);
 export const summarizerModel = flashModel(Schema.object({
@@ -80,8 +82,25 @@ async function getResponseCommunications(qualiaDoc: QualiaDoc, qualia: Qualia, c
     // Fetch pending communications for context
     const pendingCommunications = await getPendingCommunications(qualia.qualiaId);
 
-    const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
-    const prompt = `Generate new commmunications if required, keeping previous conversations in mind:\n${JSON.stringify({ myQualiaId: qualia.qualiaId, qualia: serializedQualia, money: qualia.money, newCommunications: communications })}`;
+    const { qualia: serializedGraph, recentCommunications: pendingComms } = serializeQualia(qualiaDoc, pendingCommunications);
+    const prompt = `Generate new commmunications if required, keeping recent conversations in mind:
+
+Current Qualia:
+${JSON.stringify(serializedGraph)}
+
+Context:
+${JSON.stringify({
+        myQualiaId: qualia.qualiaId,
+        money: qualia.money,
+        currentTimestamp: new Date().toString()
+    })
+        }
+
+Previous Communications:
+${JSON.stringify(pendingComms)}
+
+Recent Communications:
+${JSON.stringify(communications)}`;
     console.log(`Calling Gemini with prompt: ${prompt.substring(0, 100)}...`);
     const result = await communicationModel.generateContent(prompt);
     const response = parseJson(result.response.text());
@@ -105,15 +124,21 @@ const getMaxQualiaSizePercent = memoize(async (qualiaDoc: QualiaDoc) => {
 });
 
 async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunications: Communication[], errorInfo?: string): Promise<IntegrationResponse> {
-    const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
-    let prompt = `Integrate pending communications into the qualia. Current qualia size is ${await getMaxQualiaSizePercent(qualiaDoc)}% of the limit.
+    const { qualia: serializedGraph, recentCommunications } = serializeQualia(qualiaDoc, pendingCommunications);
+    let prompt = `Integrate recent communications into the qualia.
 API Usage:
 - To CREATE a new conclusion, specify a unique 'id' and 'newConclusion' text.
 - To UPDATE an existing conclusion, specify its 'id' and provide 'newConclusion', 'addAssumptions', or 'removeAssumptions' as needed. Omitted fields remain unchanged.
 - To DELETE a conclusion, specify its 'id' and set 'newConclusion' to empty string (""). Explicitly deleting a node is NOT required if you just want to update it.
 - You do NOT need to delete children/parents when deleting a node; references will be auto-cleaned.
 
-${JSON.stringify(serializedQualia)}`;
+Current Qualia:
+${ JSON.stringify(serializedGraph)}
+
+Current qualia size is ${await getMaxQualiaSizePercent(qualiaDoc)}% of the limit.
+
+Recent Communications:
+${JSON.stringify(recentCommunications)}`;
     if (errorInfo) {
         prompt += `\n\nPrevious integration attempt failed:\n\n${errorInfo}\n\nPlease resolve.`;
     }
@@ -161,13 +186,19 @@ async function performCompaction(qualiaDocRef: DocumentReference, lockOwnerId: s
         const currentPending = (await getPendingCommunications(qualiaDoc.qualiaId))
             .filter(c => c.id && !integratedCommunicationIds.has(c.id));
 
-        const serializedQualia = serializeQualia(qualiaDoc, currentPending);
-        const prompt = `Qualia size is ${qualiaSizePercent}% of limit. Integrate pending communications AND perform DELETE operations (by setting newConclusion to "") to reduce size.
+        const { qualia: serializedGraph, recentCommunications } = serializeQualia(qualiaDoc, currentPending);
+        const prompt = `Integrate recent communications AND perform DELETE operations(by setting newConclusion to "") to reduce size.
 API Usage:
 - To DELETE a conclusion, specify its 'id' and set 'newConclusion' to empty string ("").
 - References to deleted nodes are automatically removed from other nodes, so you don't need to manually update them.
 
-${JSON.stringify({ qualia: serializedQualia })}`;
+Current Qualia:
+${ JSON.stringify(serializedGraph)}
+
+Qualia size is ${qualiaSizePercent}% of limit.
+
+Recent Communications:
+${JSON.stringify(recentCommunications)}`;
 
         let ops: IntegrationResponse | undefined;
         let errorInfo: string | undefined;

@@ -53,11 +53,11 @@ function serializeCommunication(comm: Communication): Record<string, any> {
     const result: any = rest;
 
     if (receivedTime) {
-        result.receivedTime = receivedTime.toDate().toISOString();
+        result.receivedTime = receivedTime.toDate().toString();
         result.timeAgo = formatTimeDelta(receivedTime);
     } else if (deliveryTime) {
         // When self is the sender, we use delivery time.
-        result.receivedTime = deliveryTime.toDate().toISOString();
+        result.receivedTime = deliveryTime.toDate().toString();
         result.timeAgo = formatTimeDelta(deliveryTime);
     }
 

@@ -1221,9 +1221,11 @@ const AppContent = () => {
 
 [SYSTEM RULE]: You will receive updates marked "[PERIPHERAL FEED]". These are your own subconscious thoughts arising from background processing. Treat them as your own internal realizations to weave them in the conversation if appropriate.
 
-Here is your memory and context:
+Current Qualia (Memory):
+${qualiaDocSummary}
 
-${qualiaDocSummary}${convSummary ? "\n\nThe most recent conversation:\n\n" + convSummary : ""}`;
+${convSummary ? "Recent Conversation (Context):\n" + convSummary : ""}
+Current Timestamp: ${new Date().toString()}`;
           console.log("System instruction prepared with context:", systemInstruction);
         } catch (e) {
           console.error("Failed to fetch context for audio session:", e);
