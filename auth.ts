@@ -69,11 +69,25 @@ const startPhoneAuth = async (phoneNumber: string) => {
 const handleMessage = (event: any) => {
     try {
         log(`Received message event: ${typeof event.data} ${JSON.stringify(event.data).slice(0, 100)}`);
-        if (typeof event.data === 'string' && event.data.slice(0, 2) === '!_') return;
-        const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
-        if (data?.type === 'startPhoneAuth' && data.phoneNumber) {
-            log(`Handling startPhoneAuth for ${data.phoneNumber}`);
-            startPhoneAuth(data.phoneNumber);
+        if (typeof event.data === 'string') {
+            if (event.data.slice(0, 2) === '!_') return;
+            // Try to parse, if fails, treat as raw string or ignore
+            try {
+                const data = JSON.parse(event.data);
+                if (data?.type === 'startPhoneAuth' && data.phoneNumber) {
+                    log(`Handling startPhoneAuth for ${data.phoneNumber}`);
+                    startPhoneAuth(data.phoneNumber);
+                }
+            } catch (e) {
+                // Not JSON, ignore or log as raw
+                log(`Ignored non-JSON message: ${event.data}`);
+            }
+        } else {
+            const data = event.data;
+            if (data?.type === 'startPhoneAuth' && data.phoneNumber) {
+                log(`Handling startPhoneAuth for ${data.phoneNumber}`);
+                startPhoneAuth(data.phoneNumber);
+            }
         }
     } catch (error: any) {
         post({ type: 'authErrorK', message: `${event.data}\n${error}\n${error.stack}` || 'Invalid message' });
@@ -83,5 +97,64 @@ const handleMessage = (event: any) => {
 window.addEventListener('message', handleMessage);
 document.addEventListener('message', handleMessage);
 
+
 // Signal readiness on load
 ensureApp();
+
+// Add listener for reCAPTCHA challenges
+const observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+        if (mutation.type === 'childList') {
+            mutation.addedNodes.forEach(node => {
+                if (node instanceof HTMLElement) {
+                    const checkIframe = (iframe: HTMLIFrameElement, context: string) => {
+                        const src = iframe.src || '';
+                        if (src.includes('recaptcha')) {
+                            const isAnchor = src.includes('/anchor');
+                            const isBframe = src.includes('/bframe');
+
+                            const checkVisibility = () => {
+                                const style = window.getComputedStyle(iframe);
+                                const isVisible = style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+                                return isVisible;
+                            };
+
+                            const isVisible = checkVisibility();
+
+                            post({
+                                type: 'recaptcha-status',
+                                status: isBframe ? 'challenge_loaded' : (isAnchor ? 'anchor_loaded' : 'unknown_iframe'),
+                                src: src,
+                                isVisible: isVisible,
+                                details: context
+                            });
+
+                            // Observe for visibility changes
+                            const attrObserver = new MutationObserver(() => {
+                                const newVisible = checkVisibility();
+                                if (newVisible !== isVisible) { // Only report changes? Or just report if it becomes visible?
+                                    post({
+                                        type: 'recaptcha-status',
+                                        status: isBframe ? 'challenge_visibility_change' : 'anchor_visibility_change',
+                                        src: src,
+                                        isVisible: newVisible,
+                                        details: context
+                                    });
+                                }
+                            });
+                            attrObserver.observe(iframe, { attributes: true, attributeFilter: ['style', 'class', 'visibility', 'opacity', 'display'] });
+                        }
+                    };
+
+                    if (node.tagName === 'IFRAME') {
+                        checkIframe(node as HTMLIFrameElement, 'Direct iframe');
+                    }
+                    const nestedIframes = node.querySelectorAll('iframe');
+                    nestedIframes.forEach(iframe => checkIframe(iframe, 'Nested iframe'));
+                }
+            });
+        }
+    }
+});
+
+observer.observe(document.body, { childList: true, subtree: true });

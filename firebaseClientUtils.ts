@@ -5,7 +5,7 @@ import { db } from "./firebaseAuth";
 
 
 
-export async function sendMessage({ message, contextQualia, toQualia }: { message: string; contextQualia: ContextQualia; toQualia: ContextQualia }): Promise<void> {
+export async function sendMessage({ message, contextQualia, toQualia }: { message: string; contextQualia: ContextQualia; toQualia: ContextQualia }): Promise<string> {
   const userId = await getUserId();
 
   // build the communication object (avoid using undefined `communication`)
@@ -22,7 +22,8 @@ export async function sendMessage({ message, contextQualia, toQualia }: { messag
     seen: false,
   };
 
-  await addDoc(await communicationsCollection(), communication);
+  const docRef = await addDoc(await communicationsCollection(), communication);
+  return docRef.id;
 }
 
 export async function registerClientMessageClb(callback: (communication: Communication) => Promise<void>) {

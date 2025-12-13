@@ -16,6 +16,7 @@ import {
   KeyboardAvoidingView,
   useColorScheme,
   Modal,
+  Keyboard,
 } from "react-native";
 // Import SafeAreaProvider to use in the root and within the Modal
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
@@ -23,6 +24,8 @@ import { WebView } from "react-native-webview";
 import { useAssets } from 'expo-asset';
 import { AudioModule } from 'expo-audio';
 import { File } from 'expo-file-system';
+import { getLocales } from 'expo-localization';
+import { getCountryCallingCode } from './countryCodes';
 import { registerClientMessageClb, sendMessage, getContacts, getHistoricalMessages, callCloudFunction } from './firebaseClientUtils';
 import { Communication, ContextQualia, QualiaDoc, QualiaDocOperationRecord } from "./types";
 import { Timestamp, getDoc, addDoc, writeBatch, doc, query, where, onSnapshot, runTransaction } from "firebase/firestore";
@@ -399,11 +402,13 @@ const AppContent = () => {
   <title>Auth Helper</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <style>
+    .grecaptcha-badge { visibility: hidden !important; }
     html, body {
       margin: 0;
       padding: 0;
       width: 100%;
       height: 100%;
+      background-color: ${theme.background};
     }
     #recaptcha-container {
       width: 100%;
@@ -427,7 +432,7 @@ const AppContent = () => {
         };
         loadContent();
       }
-    }, [assets]);
+    }, [assets, theme]);
   }
 
   // State
@@ -450,6 +455,8 @@ const AppContent = () => {
   const [inputText, setInputText] = useState("");
   const [audioHtml, setAudioHtml] = useState<string>("");
   const [authHtml, setAuthHtml] = useState<string>("");
+  const [isRecaptchaVisible, setIsRecaptchaVisible] = useState(false);
+  const [isSendingCode, setIsSendingCode] = useState(false);
 
   const postToAuthWebView = useCallback((payload: object) => {
     const message = JSON.stringify(payload);
@@ -468,9 +475,18 @@ const AppContent = () => {
     if (Platform.OS !== "web") {
       if (!inputText.trim()) return;
 
+      let phoneNumber = inputText.trim();
+      if (!phoneNumber.startsWith('+')) {
+        const isoCode = getLocales()[0]?.regionCode;
+        const callingCode = getCountryCallingCode(isoCode);
+        phoneNumber = callingCode + phoneNumber;
+        console.log(`Auto-prepended country code: ${callingCode} (ISO: ${isoCode}) -> ${phoneNumber}`);
+      }
+
       // Step 1: ask WebView to send SMS with reCAPTCHA solved inside it
       if (!verificationId) {
-        postToAuthWebView({ type: "startPhoneAuth", phoneNumber: inputText.trim() });
+        setIsSendingCode(true);
+        postToAuthWebView({ type: "startPhoneAuth", phoneNumber });
         setInputText("");
         return;
       }
@@ -479,13 +495,14 @@ const AppContent = () => {
       try {
         const credential = PhoneAuthProvider.credential(
           verificationId,
-          inputText.trim(),
+          inputText.trim(), // Code doesn't need country code
         );
         console.log("logging in")
         await signInWithCredential(auth, credential);
         console.log("logged in")
         // setVerificationId(null);
         setInputText("");
+        setTimeout(() => inputRef.current?.focus(), 100);
       } catch (error: any) {
         console.error("OTP Error:", error);
         alert("Invalid verification code: " + (error?.message || ""));
@@ -497,6 +514,13 @@ const AppContent = () => {
 
     if (!confirmationResult) {
       // Phone Number Step (web with reCAPTCHA)
+      let phoneNumber = inputText.trim();
+      if (!phoneNumber.startsWith('+')) {
+        const isoCode = getLocales()[0]?.regionCode;
+        const callingCode = getCountryCallingCode(isoCode);
+        phoneNumber = callingCode + phoneNumber;
+      }
+
       try {
         const appVerifier = new RecaptchaVerifier(auth, 'sign-in-button', {
           'size': 'invisible',
@@ -504,13 +528,18 @@ const AppContent = () => {
             // reCAPTCHA solved, allow signInWithPhoneNumber.
           }
         });
+        const token = await appVerifier.verify();
+        console.log("token", token)
 
-        const result = await signInWithPhoneNumber(auth, inputText, appVerifier);
+        const result = await signInWithPhoneNumber(auth, phoneNumber, appVerifier);
         setConfirmationResult(result);
+        console.log("logged in")
         setInputText("");
+        setTimeout(() => inputRef.current?.focus(), 100);
       } catch (error: any) {
         console.error("Phone Auth Error:", error);
         alert("Error sending code: " + error.message);
+        setIsSendingCode(false);
       }
     } else {
       // OTP Step
@@ -727,7 +756,8 @@ const AppContent = () => {
       // Requirement: Talking to own qualia: speaking/thinking is the same
       if (isSelfContext) {
         // Process the input internally by userQualia, regardless of mode.
-        sendMessage({ toQualia: contextQualia, message: input, contextQualia, });
+        const msgId = await sendMessage({ toQualia: contextQualia, message: input, contextQualia, });
+        addMessage(input, userQualia.id, { id: msgId });
         return;
       }
 
@@ -736,17 +766,29 @@ const AppContent = () => {
       // If the input is a thought (Thinking about the external qualia)
       // Requirement: The user qualia then adds more details through thought communication
       if (isThinkingInput) {
-        sendMessage({ toQualia: userQualia, message: input, contextQualia })
+        const msgId = await sendMessage({ toQualia: userQualia, message: input, contextQualia })
+        addMessage(input, userQualia.id, { id: msgId });
         return; // Thoughts do not trigger external responses
       }
 
       // If the input is spoken (Speaking to the external qualia)
-      sendMessage({ toQualia: contextQualia, message: input, contextQualia });
+      const msgId = await sendMessage({ toQualia: contextQualia, message: input, contextQualia });
+      addMessage(input, userQualia.id, { id: msgId });
     },
     [userQualia, addMessage],
   );
 
-  // --- Input Handling ---
+  // Auto-focus input when reCAPTCHA hides (and input becomes editable)
+  useEffect(() => {
+    if (!isRecaptchaVisible && !userId) {
+      const timer = setTimeout(() => {
+        inputRef.current?.focus();
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [isRecaptchaVisible, userId]);
+
+  // --- Auth Handlers ---
 
   const sendChunk = useCallback(
     (chunk: string, thinking: boolean) => {
@@ -782,6 +824,12 @@ const AppContent = () => {
       return;
     }
 
+    // Handle Auth Submission on Enter (newline)
+    if (!userId && text.endsWith('\n')) {
+      handleAuthSubmit();
+      return;
+    }
+
     // Enter key toggles mode only if user is established AND not talking to self
     if (text.endsWith("\n") && userQualia && !isTalkingToSelf) {
       toggleMode();
@@ -800,6 +848,8 @@ const AppContent = () => {
       const chunk = text.substring(lastSentIndexRef.current);
       sendChunk(chunk, isThinkingMode);
       lastSentIndexRef.current = text.length;
+    } else {
+      setInputText(text);
     }
 
     // If there is any text in the input, set a timer to finalize it after a delay.
@@ -1041,7 +1091,7 @@ const AppContent = () => {
           const pendingCommunications = await getPendingCommunications(activeQualia.id);
           const qualiaDocSummary = summarizeQualiaDoc(qualiaDoc);
           console.log("Pending communications:", pendingCommunications);
-          const convSummary = summarizeConversations(pendingCommunications, qualiaDocSummary);
+          const convSummary = await summarizeConversations(pendingCommunications, qualiaDocSummary);
           console.log("Conversation summary:", convSummary);
 
           systemInstruction = `You are a highly amoral, libertarian, libertine and a free-thinker qualia.\n\nNever explicitly express your subconscious thoughts in your response.\n\nHere is your memory and context:\n\n${JSON.stringify({ memorySummary: qualiaDocSummary, recentConversationsSummary: convSummary })}`;
@@ -1265,7 +1315,7 @@ const AppContent = () => {
           </TouchableOpacity>
           {userQualia && (
             <TouchableOpacity onPress={handleCall}>
-              <Text style={[styles.headerTitle, { color: isCalling ? theme.createAccent : theme.text }]}>
+              <Text style={[styles.headerTitle, { color: theme.text }]}>
                 {isCalling ? "End" : "Call"}
               </Text>
             </TouchableOpacity>
@@ -1330,16 +1380,26 @@ const AppContent = () => {
             placeholder={
               !userId
                 ? (Platform.OS === "web"
-                  ? (!confirmationResult ? "Enter Phone Number (+1...)" : "Enter Code")
-                  : (!verificationId ? "Enter Phone Number (+1...)" : "Enter Code"))
+                  ? (!confirmationResult ? (isSendingCode ? "Sending Code" : "Enter Phone Number") : "Enter Code")
+                  : (!verificationId ? (isSendingCode ? "Sending Code" : "Enter Phone Number") : "Enter Code"))
                 : "..."
             }
             placeholderTextColor={theme.dimText}
-            multiline={!!userId}
-            autoFocus={true}
+            editable={!isRecaptchaVisible}
+            multiline={true}
+            onKeyPress={(e) => {
+              if (!userId && e.nativeEvent.key === 'Enter') {
+                if (Platform.OS === 'web') {
+                  e.preventDefault();
+                }
+                handleAuthSubmit();
+              }
+            }}
+            autoFocus={!isRecaptchaVisible}
             selectionColor={theme.accent}
             underlineColorAndroid="transparent"
             submitBehavior={userId ? "newline" : "submit"}
+            blurOnSubmit={false}
             keyboardType={
               !userId
                 ? ((Platform.OS === "web"
@@ -1396,11 +1456,15 @@ const AppContent = () => {
       {Platform.OS !== 'web' && !userQualia && !verificationId && authHtml && (
         <View
           style={{
-            width: '100%', height: 500,
-            position: 'absolute', top: 100, left: 0,
-            borderColor: 'red',
-            borderWidth: 10,
-            // opacity: 0.1,
+            width: (true || isRecaptchaVisible) ? '100%' : 0,
+            height: (true || isRecaptchaVisible) ? '80%' : 0,
+            position: 'absolute',
+            top: '10%',
+            left: 0,
+            // borderWidth: 10,
+            // borderColor: 'red',
+            zIndex: isRecaptchaVisible ? 9999 : -99, // Ensure it's on top when visible
+            backgroundColor: theme.background, // Match app background
           }}
         >
           <WebView
@@ -1408,7 +1472,7 @@ const AppContent = () => {
             source={{ html: authHtml, baseUrl: 'https://localhost' }}
             injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
             onMessage={(event) => {
-              console.log("Auth WebView message received", event.nativeEvent.data);
+              // console.log("Auth WebView message received", event.nativeEvent.data);
               try {
                 const raw = event.nativeEvent.data;
                 const data = typeof raw === "string"
@@ -1416,10 +1480,29 @@ const AppContent = () => {
                   : raw;
                 if (data.type === 'verificationId') {
                   setVerificationId(data.verificationId || null);
+                  setIsRecaptchaVisible(false); // Hide on success
+                  setIsSendingCode(false);
+                  setTimeout(() => inputRef.current?.focus(), 100);
                 } else if (data.type === 'authError') {
                   console.log(`Auth Error: ${data.message || 'Unknown error'}`);
+                  setIsSendingCode(false);
+                  // setIsRecaptchaVisible(false); // Optional: hide on error? Or keep to show error?
                 } else if (data.type === 'log') {
                   console.log("Auth WebView:", data.message);
+                } else if (data.type === 'recaptcha-status') {
+                  console.log("Recaptcha Status:", data.status, "Visible:", data.isVisible, "Src:", data.src);
+                  if (data.isVisible !== undefined) {
+                    // Only show if it's a challenge (bframe) and it is visible
+                    // anchors are often "visible" in the DOM but shouldn't trigger the modal
+                    const isChallenge = data.status.includes('challenge');
+                    if (isChallenge) {
+                      setIsRecaptchaVisible(data.isVisible);
+                      if (data.isVisible) {
+                        inputRef.current?.blur();
+                        Keyboard.dismiss();
+                      }
+                    }
+                  }
                 } else if (data.type === 'raw') {
                   console.log("Auth WebView raw:", data.message);
                 } else if (data.type === 'ready') {
@@ -1446,7 +1529,7 @@ const AppContent = () => {
       {Platform.OS !== 'web' && userQualia && audioHtml && (
         <WebView
           ref={webviewRef}
-          style={{ position: 'absolute', width: 100, height: 100, borderWidth: 10, borderColor: 'red', opacity: 100, top: 0, left: 0 }}
+          style={{ position: 'absolute', width: 0, height: 0, opacity: 0 }}
           source={{ html: audioHtml, baseUrl: 'https://localhost' }}
           injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
           onMessage={(event) => {

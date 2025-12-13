@@ -662,19 +662,19 @@
       });
     }
     next(value) {
-      this.forEachObserver((observer) => {
-        observer.next(value);
+      this.forEachObserver((observer2) => {
+        observer2.next(value);
       });
     }
     error(error) {
-      this.forEachObserver((observer) => {
-        observer.error(error);
+      this.forEachObserver((observer2) => {
+        observer2.error(error);
       });
       this.close(error);
     }
     complete() {
-      this.forEachObserver((observer) => {
-        observer.complete();
+      this.forEachObserver((observer2) => {
+        observer2.complete();
       });
       this.close();
     }
@@ -685,7 +685,7 @@
      *   call to subscribe().
      */
     subscribe(nextOrObserver, error, complete) {
-      let observer;
+      let observer2;
       if (nextOrObserver === void 0 && error === void 0 && complete === void 0) {
         throw new Error("Missing Observer.");
       }
@@ -694,38 +694,38 @@
         "error",
         "complete"
       ])) {
-        observer = nextOrObserver;
+        observer2 = nextOrObserver;
       } else {
-        observer = {
+        observer2 = {
           next: nextOrObserver,
           error,
           complete
         };
       }
-      if (observer.next === void 0) {
-        observer.next = noop;
+      if (observer2.next === void 0) {
+        observer2.next = noop;
       }
-      if (observer.error === void 0) {
-        observer.error = noop;
+      if (observer2.error === void 0) {
+        observer2.error = noop;
       }
-      if (observer.complete === void 0) {
-        observer.complete = noop;
+      if (observer2.complete === void 0) {
+        observer2.complete = noop;
       }
       const unsub = this.unsubscribeOne.bind(this, this.observers.length);
       if (this.finalized) {
         this.task.then(() => {
           try {
             if (this.finalError) {
-              observer.error(this.finalError);
+              observer2.error(this.finalError);
             } else {
-              observer.complete();
+              observer2.complete();
             }
           } catch (e) {
           }
           return;
         });
       }
-      this.observers.push(observer);
+      this.observers.push(observer2);
       return unsub;
     }
     // Unsubscribe is synchronous - we guarantee that no events are sent to
@@ -4193,7 +4193,7 @@
     constructor(auth2) {
       this.auth = auth2;
       this.observer = null;
-      this.addObserver = createSubscribe((observer) => this.observer = observer);
+      this.addObserver = createSubscribe((observer2) => this.observer = observer2);
     }
     get next() {
       _assert(
@@ -8476,11 +8476,23 @@ ${error.stack}` });
   var handleMessage = (event) => {
     try {
       log(`Received message event: ${typeof event.data} ${JSON.stringify(event.data).slice(0, 100)}`);
-      if (typeof event.data === "string" && event.data.slice(0, 2) === "!_") return;
-      const data = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
-      if (data?.type === "startPhoneAuth" && data.phoneNumber) {
-        log(`Handling startPhoneAuth for ${data.phoneNumber}`);
-        startPhoneAuth(data.phoneNumber);
+      if (typeof event.data === "string") {
+        if (event.data.slice(0, 2) === "!_") return;
+        try {
+          const data = JSON.parse(event.data);
+          if (data?.type === "startPhoneAuth" && data.phoneNumber) {
+            log(`Handling startPhoneAuth for ${data.phoneNumber}`);
+            startPhoneAuth(data.phoneNumber);
+          }
+        } catch (e) {
+          log(`Ignored non-JSON message: ${event.data}`);
+        }
+      } else {
+        const data = event.data;
+        if (data?.type === "startPhoneAuth" && data.phoneNumber) {
+          log(`Handling startPhoneAuth for ${data.phoneNumber}`);
+          startPhoneAuth(data.phoneNumber);
+        }
       }
     } catch (error) {
       post({ type: "authErrorK", message: `${event.data}
@@ -8491,6 +8503,55 @@ ${error.stack}` || "Invalid message" });
   window.addEventListener("message", handleMessage);
   document.addEventListener("message", handleMessage);
   ensureApp();
+  var observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      if (mutation.type === "childList") {
+        mutation.addedNodes.forEach((node) => {
+          if (node instanceof HTMLElement) {
+            const checkIframe = (iframe, context) => {
+              const src = iframe.src || "";
+              if (src.includes("recaptcha")) {
+                const isAnchor = src.includes("/anchor");
+                const isBframe = src.includes("/bframe");
+                const checkVisibility = () => {
+                  const style = window.getComputedStyle(iframe);
+                  const isVisible2 = style.visibility !== "hidden" && style.display !== "none" && style.opacity !== "0";
+                  return isVisible2;
+                };
+                const isVisible = checkVisibility();
+                post({
+                  type: "recaptcha-status",
+                  status: isBframe ? "challenge_loaded" : isAnchor ? "anchor_loaded" : "unknown_iframe",
+                  src,
+                  isVisible,
+                  details: context
+                });
+                const attrObserver = new MutationObserver(() => {
+                  const newVisible = checkVisibility();
+                  if (newVisible !== isVisible) {
+                    post({
+                      type: "recaptcha-status",
+                      status: isBframe ? "challenge_visibility_change" : "anchor_visibility_change",
+                      src,
+                      isVisible: newVisible,
+                      details: context
+                    });
+                  }
+                });
+                attrObserver.observe(iframe, { attributes: true, attributeFilter: ["style", "class", "visibility", "opacity", "display"] });
+              }
+            };
+            if (node.tagName === "IFRAME") {
+              checkIframe(node, "Direct iframe");
+            }
+            const nestedIframes = node.querySelectorAll("iframe");
+            nestedIframes.forEach((iframe) => checkIframe(iframe, "Nested iframe"));
+          }
+        });
+      }
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
 })();
 /*! Bundled license information:
 

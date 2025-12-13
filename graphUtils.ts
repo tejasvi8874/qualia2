@@ -146,7 +146,7 @@ export function serializeQualia(doc: QualiaDoc, pendingCommunications: Communica
         serializedNodes.push({
             id: node.id,
             conclusion: node.conclusion,
-            assumptions: assumptions
+            assumptions: node.assumptionIds
         });
 
         // Add children to current set
