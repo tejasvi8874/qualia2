@@ -2,10 +2,13 @@
   "license": "0BSD",
   "main": "index.ts",
   "scripts": {
-    "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "web": "expo start --web"
+    "start": "npm run build:bundles && expo start",
+    "android": "npm run build:bundles && expo start --android",
+    "ios": "npm run build:bundles && expo start --ios",
+    "web": "npm run build:bundles && expo start --web",
+    "build:bundles": "npm run build:audio && npm run build:auth",
+    "build:audio": "esbuild audio.ts --bundle --outfile=public/audio.bundle --format=iife --platform=browser --sourcemap",
+    "build:auth": "esbuild auth.ts --bundle --outfile=public/auth.bundle --format=iife --platform=browser --sourcemap"
   },
   "dependencies": {
     "@expo/metro-runtime": "~6.1.2",
@@ -32,6 +35,8 @@
   "devDependencies": {
     "@babel/core": "^7.25.2",
     "@types/react": "~19.1.10",
+    "@types/react-native-web": "^0.19.2",
+    "esbuild": "^0.27.0",
     "eslint": "^9.39.1",
     "firebase-admin": "^13.5.0",
     "googleapis": "^164.1.0",

@@ -5,22 +5,13 @@ import {
     getFirestore,
     persistentLocalCache,
     persistentMultipleTabManager,
-    collection,
-    DocumentData,
-    QuerySnapshot,
-    DocumentReference,
-    serverTimestamp,
     initializeFirestore,
-    Timestamp,
 } from "firebase/firestore";
-import { getAI, getGenerativeModel, GoogleAIBackend } from "firebase/ai";
+import { getAI, GoogleAIBackend } from "firebase/ai";
 
 import { initializeApp } from "firebase/app";
-import { getFunctions } from "firebase/functions";
-import { Communications } from "./types";
-import Constants from "expo-constants";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { firebaseConfig } from "./firebaseConfig";
+import Constants from "expo-constants";
 
 const app = initializeApp(firebaseConfig);
 initializeFirestore(app, {
@@ -28,7 +19,8 @@ initializeFirestore(app, {
         ? persistentLocalCache({ tabManager: persistentMultipleTabManager() })
         : persistentLocalCache()
 });
-initializeAuth(app, {persistence: Constants.platform?.web ? browserLocalPersistence : getReactNativePersistence(ReactNativeAsyncStorage) });
+console.log({ Constants, p: Constants.platform, w: Constants.platform?.web });
+initializeAuth(app, { persistence: Constants.platform?.web ? browserLocalPersistence : getReactNativePersistence(ReactNativeAsyncStorage) });
 export const auth = getAuth(app);
 auth.useDeviceLanguage();
 

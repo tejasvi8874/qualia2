@@ -28,7 +28,8 @@
         "android.permission.RECORD_AUDIO",
         "android.permission.MODIFY_AUDIO_SETTINGS",
         "android.permission.RECORD_AUDIO",
-        "android.permission.MODIFY_AUDIO_SETTINGS"
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.INTERNET"
       ]
     },
     "web": {
@@ -37,7 +38,16 @@
     },
     "plugins": [
       "expo-font",
-      "expo-audio"
+      "expo-audio",
+      [
+        "expo-asset",
+        {
+          "assets": [
+            "./public/audio.bundle",
+            "./public/auth.bundle"
+          ]
+        }
+      ]
     ],
     "extra": {
       "eas": {

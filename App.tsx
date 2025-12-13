@@ -20,7 +20,10 @@ import {
 // Import SafeAreaProvider to use in the root and within the Modal
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
-import { getUserId, registerClientMessageClb, sendMessage, getContacts, getHistoricalMessages, getQualia, callCloudFunction } from './firebaseClientUtils';
+import { useAssets } from 'expo-asset';
+import { AudioModule } from 'expo-audio';
+import { File } from 'expo-file-system';
+import { registerClientMessageClb, sendMessage, getContacts, getHistoricalMessages, callCloudFunction } from './firebaseClientUtils';
 import { Communication, ContextQualia, QualiaDoc } from "./types";
 import { Timestamp, getDoc, addDoc, writeBatch, doc } from "firebase/firestore";
 import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef, updateContacts } from "./server";
@@ -32,7 +35,6 @@ import { firebaseConfig } from "./firebaseConfig";
 import { startAudioSession } from "./audioSession";
 import { LiveSession } from "firebase/ai";
 import { FUNCTION_NAMES } from "./functions/src/shared";
-import { audioHtml } from './public/webview/audioHtml';
 
 declare global {
   interface Window {
@@ -347,6 +349,17 @@ const AppContent = () => {
   const theme = useMemo(() => getTheme(colorScheme), [colorScheme]);
 
   useEffect(() => {
+    (async () => {
+      if (Platform.OS !== 'web') {
+        const status = await AudioModule.requestRecordingPermissionsAsync();
+        if (!status.granted) {
+          console.warn('Permission to access microphone was denied');
+        }
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
     // For web, inject CSS to hide the reCAPTCHA badge.
     if (Platform.OS === "web") {
       const style = document.createElement("style");
@@ -355,6 +368,67 @@ const AppContent = () => {
     }
   }, []);
 
+  if (Platform.OS !== "web") {
+    const [assets, error] = useAssets([
+      require('./public/audio.bundle'),
+      require('./public/auth.bundle'),
+    ]);
+
+    useEffect(() => {
+      if (assets) {
+        const [audioAsset, authAsset] = assets;
+
+        const loadContent = async () => {
+          try {
+            if (audioAsset?.localUri) {
+              const file = new File(audioAsset.localUri);
+              const htmlContent = await file.text();
+              console.log("loaded audio html");
+              setAudioHtml(`<h1>haha<h1><script>${htmlContent}</script>`);
+            }
+
+            if (authAsset?.localUri) {
+              const file = new File(authAsset.localUri);
+              const jsContent = await file.text();
+              console.log("loaded auth bundle");
+              setAuthHtml(`
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Auth Helper</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+    }
+    #recaptcha-container {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+  </style>
+</head>
+<body>
+  <div id="recaptcha-container"></div>
+  <script>${jsContent}</script>
+</body>
+</html>
+            `);
+            }
+          } catch (e) {
+            console.error("Failed to load assets content", e);
+          }
+        };
+        loadContent();
+      }
+    }, [assets]);
+  }
+
   // State
   const [userQualia, setUserQualia] = useState<ContextQualia | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
@@ -362,8 +436,8 @@ const AppContent = () => {
   const webviewRef = useRef<WebView>(null);
   const authWebViewRef = useRef<WebView>(null);
   const authWebViewReady = useRef(false);
-  const pendingAuthCommand = useRef<string | null>(null);
   const audioWebViewReady = useRef(false);
+  const pendingAuthCommand = useRef<string | null>(null);
   const pendingAudioCommand = useRef<string | null>(null);
   const [liveSession, setLiveSession] = useState<LiveSession | null>(null);
   const [graphError, setGraphError] = useState<string | null>(null);
@@ -374,6 +448,7 @@ const AppContent = () => {
   const postToAuthWebView = useCallback((payload: object) => {
     const message = JSON.stringify(payload);
     if (authWebViewReady.current && authWebViewRef.current) {
+      console.log("sent", message)
       authWebViewRef.current.postMessage(message);
       return true;
     }
@@ -400,8 +475,10 @@ const AppContent = () => {
           verificationId,
           inputText.trim(),
         );
+        console.log("logging in")
         await signInWithCredential(auth, credential);
-        setVerificationId(null);
+        console.log("logged in")
+        // setVerificationId(null);
         setInputText("");
       } catch (error: any) {
         console.error("OTP Error:", error);
@@ -1191,103 +1268,67 @@ const AppContent = () => {
           onSignOut={handleSignOut}
         />
         <View nativeID="sign-in-button" />
-        {Platform.OS !== 'web' && !userQualia && (
-          <View
-            style={{
-              width: '100%', height: 100,
-              position: 'absolute', top: 0, left: 0,
-              borderColor: 'red',
-              borderWidth: 10,
-              // opacity: 0.1,
-            }}
-          >
-            <WebView
-              ref={authWebViewRef}
-              source={require('./public/webview/auth.html')}
-              injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
-              onMessage={(event) => {
-                console.log("Auth WebView message received", event.nativeEvent.data.slice(0, 100));
-                try {
-                  const raw = event.nativeEvent.data;
-                  const data = typeof raw === "string"
-                    ? (() => { try { return JSON.parse(raw); } catch { return { type: "raw", message: raw }; } })()
-                    : raw;
-                  if (data.type === 'verificationId') {
-                    setVerificationId(data.verificationId || null);
-                  } else if (data.type === 'authError') {
-                    console.log(`Auth Error: ${data.message || 'Unknown error'}`);
-                  } else if (data.type === 'log') {
-                    console.log("Auth WebView:", data.message);
-                  } else if (data.type === 'raw') {
-                    console.log("Auth WebView raw:", data.message);
-                  } else if (data.type === 'ready') {
-                    authWebViewReady.current = true;
-                    if (pendingAuthCommand.current && authWebViewRef.current) {
-                      authWebViewRef.current.postMessage(pendingAuthCommand.current);
-                      pendingAuthCommand.current = null;
-                    }
+        {Platform.OS !== 'web' && (
+          <WebView
+            ref={authWebViewRef}
+            style={{ position: 'absolute', width: 1, height: 1, opacity: 0, top: 0, left: 0 }}
+            source={require('./public/webview/auth.html')}
+            injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
+            onMessage={(event) => {
+              try {
+                const raw = event.nativeEvent.data;
+                const data = typeof raw === "string"
+                  ? (() => { try { return JSON.parse(raw); } catch { return { type: "raw", message: raw }; } })()
+                  : raw;
+                if (data.type === 'verificationId') {
+                  setVerificationId(data.verificationId || null);
+                  setGraphError(null);
+                } else if (data.type === 'authError') {
+                  setGraphError(`Auth Error: ${data.message || 'Unknown error'}`);
+                } else if (data.type === 'log') {
+                  console.log("Auth WebView:", data.message);
+                } else if (data.type === 'raw') {
+                  console.log("Auth WebView raw:", data.message);
+                } else if (data.type === 'ready') {
+                  authWebViewReady.current = true;
+                  setGraphError(null);
+                  if (pendingAuthCommand.current && authWebViewRef.current) {
+                    authWebViewRef.current.postMessage(pendingAuthCommand.current);
+                    pendingAuthCommand.current = null;
                   }
-                } catch (e) {
-                  console.error("Auth WebView parse error", e);
                 }
-              }}
-              onLoad={() => {
-                authWebViewReady.current = true;
-                if (pendingAuthCommand.current && authWebViewRef.current) {
-                  authWebViewRef.current.postMessage(pendingAuthCommand.current);
-                  pendingAuthCommand.current = null;
-                }
-              }}
-              originWhitelist={["*"]}
-            />
-          </View>)}
+              } catch (e) {
+                console.error("Auth WebView parse error", e);
+              }
+            }}
+            onLoad={() => {
+              authWebViewReady.current = true;
+              if (pendingAuthCommand.current && authWebViewRef.current) {
+                authWebViewRef.current.postMessage(pendingAuthCommand.current);
+                pendingAuthCommand.current = null;
+              }
+            }}
+            originWhitelist={["*"]}
+          />
+        )}
         {Platform.OS !== 'web' && userQualia && (
           <WebView
             ref={webviewRef}
-            style={{ position: 'absolute', width: 100, height: 100, borderWidth: 10, borderColor: 'red', opacity: 100, top: 0, left: 0 }}
-            source={{ html: audioHtml, baseUrl: 'https://localhost' }}
+            style={{ position: 'absolute', width: 1, height: 1, opacity: 0, top: 0, left: 0 }}
+            source={require('./public/webview/audio.html')}
             injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
             onMessage={(event) => {
-              const raw = event.nativeEvent.data;
-              let data: any;
-              try {
-                data = typeof raw === "string" ? JSON.parse(raw) : raw;
-              } catch (err) {
-                console.warn("Audio WebView message parse failed", err, raw);
-                return;
-              }
+              const data = JSON.parse(event.nativeEvent.data);
               if (data.type === 'user') {
                 onTranscriptFlush('user', data.message);
               } else if (data.type === 'gemini') {
                 onTranscriptFlush('gemini', data.message);
               } else if (data.type === 'ended') {
                 onTranscriptFlush('ended', '');
-                setIsCalling(false);
-              } else if (data.type === 'log') {
-                console.log("Audio WebView:", data.message);
-              } else if (data.type === 'ready') {
-                audioWebViewReady.current = true;
-                if (pendingAudioCommand.current && webviewRef.current) {
-                  webviewRef.current.postMessage(pendingAudioCommand.current);
-                  pendingAudioCommand.current = null;
-                }
-              } else if (data.type === 'authError') {
-                console.log(`Audio Auth Error: ${data.message || 'Unknown error'}`);
               }
             }}
-            onLoad={() => {
-              audioWebViewReady.current = true;
-              if (pendingAudioCommand.current && webviewRef.current) {
-                webviewRef.current.postMessage(pendingAudioCommand.current);
-                pendingAudioCommand.current = null;
-              }
-            }}
-            allowsInlineMediaPlayback={true}
-            mediaPlaybackRequiresUserAction={false}
-            originWhitelist={["*"]}
           />
         )}
-      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 };
