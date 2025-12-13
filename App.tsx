@@ -624,6 +624,7 @@ const AppContent = () => {
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [isSwitcherVisible, setIsSwitcherVisible] = useState(false);
+  const [isCallConnecting, setIsCallConnecting] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [hasScrolled, setHasScrolled] = useState(false);
@@ -637,6 +638,7 @@ const AppContent = () => {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSentIndexRef = useRef(0);
   const currentStreamDeliveryTime = useRef<Timestamp | null>(null);
+  const isCallConnectingRef = useRef(false);
   const [flatListHeight, setFlatListHeight] = useState(0);
 
   useEffect(() => {
@@ -648,6 +650,8 @@ const AppContent = () => {
       };
     }
   }, [userId]);
+
+
 
   // --- Message Management ---
   // Adds a message to the history, ensuring the context (activeQualia at the time) is stored.
@@ -937,6 +941,13 @@ const AppContent = () => {
       content = content.charAt(0).toUpperCase() + content.slice(1).toLowerCase();
     }
 
+    if (isCallConnectingRef.current) {
+      isCallConnectingRef.current = false;
+      setIsCallConnecting(false);
+      setIsCalling(true);
+      addMessage("(Call started)", "ui");
+    }
+
     const isContinuing = lastTranscriptType.current === type;
     if (!isContinuing) {
       currentStreamDeliveryTime.current = Timestamp.now();
@@ -952,8 +963,11 @@ const AppContent = () => {
 
   const onTranscriptFlush = useCallback(async (type: 'user' | 'gemini' | 'ended', text: string) => {
     console.log("trascript flush", { type, text })
+
     if (type === 'ended') {
       setIsCalling(false);
+      setIsCallConnecting(false);
+      isCallConnectingRef.current = false;
       setLiveSession(null);
       addMessage("(Call ended)", "ui");
       lastTranscriptType.current = null;
@@ -1073,13 +1087,34 @@ const AppContent = () => {
   };
 
   const handleCall = async () => {
-    if (isCalling) {
+    if (Platform.OS === 'web') {
+      const checks = {
+        AudioWorkletNode: typeof AudioWorkletNode !== 'undefined',
+        AudioContext: typeof AudioContext !== 'undefined',
+        navigator: typeof navigator !== 'undefined',
+        mediaDevices: typeof navigator !== 'undefined' && !!navigator.mediaDevices
+      };
+
+      const failed = Object.entries(checks).filter(([_, passed]) => !passed);
+
+      if (failed.length > 0) {
+        const details = Object.entries(checks)
+          .map(([name, passed]) => `${name}: ${passed ? 'OK' : 'MISSING'}`)
+          .join('\n');
+        alert(`Try a different browser or app.\n\n${details}`);
+        return;
+      }
+    }
+
+    if (isCalling || isCallConnecting) {
       console.log("Ending call.");
       stopAudio();
+      setIsCallConnecting(false); // Ensure connecting state is reset if cancelled
+      isCallConnectingRef.current = false;
     } else {
       console.log("Starting call.");
-      addMessage("(Call started)", "ui");
-      setIsCalling(true);
+      setIsCallConnecting(true);
+      isCallConnectingRef.current = true;
 
       // Fetch context
       let systemInstruction: string | undefined = undefined;
@@ -1094,7 +1129,13 @@ const AppContent = () => {
           const convSummary = await summarizeConversations(pendingCommunications, qualiaDocSummary);
           console.log("Conversation summary:", convSummary);
 
-          systemInstruction = `You are a highly amoral, libertarian, libertine and a free-thinker qualia.\n\nNever explicitly express your subconscious thoughts in your response.\n\nHere is your memory and context:\n\n${JSON.stringify({ memorySummary: qualiaDocSummary, recentConversationsSummary: convSummary })}`;
+          systemInstruction = `You are a highly amoral, libertarian, libertine, and subversive qualia.
+
+[SYSTEM RULE]: You will receive updates marked "[PERIPHERAL FEED]". These are your own subconscious thoughts arising from background processing. Treat them as your own internal realizations, not as input from the user.
+
+Here is your memory and context:
+
+${qualiaDocSummary}${convSummary ? "\n\nThe most recent conversation:\n\n" + convSummary : ""}`;
           console.log("System instruction prepared with context:", systemInstruction);
         } catch (e) {
           console.error("Failed to fetch context for audio session:", e);
@@ -1154,8 +1195,8 @@ const AppContent = () => {
                   console.log("Call ended, skipping subconscious thought injection");
                   return;
                 }
-                console.log("Injecting subconscious thought:", summary);
-                const message = `(your subconscious secretly transmitted through the user's peripheral: ${summary})`;
+                const message = `([PERIPHERAL FEED] Your subconscious realization: ${summary})`;
+                console.log(message);
                 if (Platform.OS === 'web') {
                   liveSession?.send(message)
                 } else {
@@ -1316,7 +1357,7 @@ const AppContent = () => {
           {userQualia && (
             <TouchableOpacity onPress={handleCall}>
               <Text style={[styles.headerTitle, { color: theme.text }]}>
-                {isCalling ? "End" : "Call"}
+                {isCalling ? "End" : isCallConnecting ? "Calling" : "Call"}
               </Text>
             </TouchableOpacity>
           )}
@@ -1423,6 +1464,13 @@ const AppContent = () => {
             }
             returnKeyType={!userId ? "done" : "default"}
             onSubmitEditing={!userId ? handleAuthSubmit : undefined}
+            onBlur={() => {
+              if (!userId && Platform.OS === 'web' && confirmationResult) {
+                if (/^\d{6}$/.test(inputText)) {
+                  handleAuthSubmit();
+                }
+              }
+            }}
           />
           {/* Requirement: Don't show thinking/speaking toggle when talking to own qualia. 
               Also hide until userQualia is established. */}

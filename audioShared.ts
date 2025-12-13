@@ -1,7 +1,8 @@
 import { FunctionCallingMode, LiveModelParams, LiveSession, ResponseModality } from "firebase/ai";
 
 export const AUDIO_GENERATION_CONFIG: LiveModelParams = {
-    model: "gemini-live-2.5-flash-preview",
+    model: "gemini-2.5-flash-native-audio-preview-09-2025",
+    // model: "gemini-live-2.5-flash-preview",
     generationConfig: {
         inputAudioTranscription: {},
         outputAudioTranscription: {},
@@ -61,7 +62,7 @@ export async function processStreamMessages(
                     callbacks.onUserPart(text);
                     userTranscription.push(text);
                     if (userFlushTimeout) clearTimeout(userFlushTimeout);
-                    userFlushTimeout = setTimeout(flushUser, 1000);
+                    userFlushTimeout = setTimeout(flushUser, 2000);
                 }
                 if (message.outputTranscription?.text) {
                     flushUser();
@@ -69,7 +70,7 @@ export async function processStreamMessages(
                     callbacks.onModelPart(text);
                     modelTranscription.push(text);
                     if (modelFlushTimeout) clearTimeout(modelFlushTimeout);
-                    modelFlushTimeout = setTimeout(flushModel, 1000);
+                    modelFlushTimeout = setTimeout(flushModel, 2000);
                 }
 
                 if (callbacks.onAudioData) {
@@ -118,6 +119,7 @@ export async function setupAudioSession(
     const session = await connectAndStartAudioSession(ai, systemInstruction);
 
     if (initialMessage) {
+        console.log(`intial message sent ${initialMessage}`)
         session.send(initialMessage);
     }
 

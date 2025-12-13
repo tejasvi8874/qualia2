@@ -56,9 +56,18 @@ const summarizerModel = flashModel(Schema.object({
     },
 }));
 
-const getResponseCommunicationsRateLimiter = new RateLimiter(60, "ResponseCommunications");
-const summarizerRateLimiter = new RateLimiter(3, "Summarizer");
-const integrationRateLimiter = new RateLimiter(60, "Integration");
+const getResponseCommunicationsRateLimiter = new RateLimiter(15, "ResponseCommunications");
+const summarizerRateLimiter = new RateLimiter(5, "Summarizer");
+const integrationRateLimiter = new RateLimiter(3, "Integration");
+
+const parseJson = (json: string) => {
+    try {
+        return JSON.parse(json);
+    } catch (err) {
+        console.error("Failed to parse JSON", err, `Input: ${json}`);
+        throw err;
+    }
+}
 
 async function getResponseCommunications(qualiaDoc: QualiaDoc, qualia: Qualia, communications: Partial<Communication>[]): Promise<Communications> {
     console.log("Awaiting rate limiter...");
@@ -72,7 +81,7 @@ async function getResponseCommunications(qualiaDoc: QualiaDoc, qualia: Qualia, c
     const prompt = `Generate new commmunications if required, keeping previous conversations in mind:\n${JSON.stringify({ myQualiaId: qualia.qualiaId, qualia: serializedQualia, money: qualia.money, newCommunications: communications })}`;
     console.log(`Calling Gemini with prompt: ${prompt.substring(0, 100)}...`);
     const result = await communicationModel.generateContent(prompt);
-    const response = JSON.parse(result.response.text());
+    const response = parseJson(result.response.text());
     console.log(`Received response from Gemini: ${JSON.stringify(response)}`);
     return response;
 }
@@ -94,7 +103,7 @@ async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunicatio
     console.log({ qualiaDocTokensInt: await summarizerModel.countTokens(Object.values(serializedQualia.qualia).map(x => x.conclusion).join("\n")) })
     console.log({ qualiaDocTokens: await integrationModel.countTokens(JSON.stringify(qualiaDoc)) })
     console.log({ usageMetadata: result.response.usageMetadata });
-    return JSON.parse(result.response.text());
+    return parseJson(result.response.text());
 }
 
 
@@ -152,7 +161,7 @@ async function performCompaction(qualiaDocRef: DocumentReference, lockOwnerId: s
                 console.log("Awaiting integration rate limiter...");
                 await integrationRateLimiter.acquire();
                 const result = await integrationModel.generateContent(currentPrompt);
-                ops = JSON.parse(result.response.text()) as IntegrationResponse;
+                ops = parseJson(result.response.text()) as IntegrationResponse;
                 lastOperations = ops.operations;
 
                 // Log operations immediately
@@ -955,7 +964,7 @@ export async function summarizeConversations(conversations: Communication[], qua
     console.log("Awaiting summarizer rate limiter...");
     await summarizerRateLimiter.acquire();
     const result = await summarizerModel.generateContent(prompt);
-    const response = JSON.parse(result.response.text());
+    const response = parseJson(result.response.text());
     return response.summary;
 }
 
@@ -966,6 +975,6 @@ export async function summarizeOperations(operations: IntegrationOperation[], qu
     console.log("Awaiting summarizer rate limiter...");
     await summarizerRateLimiter.acquire();
     const result = await summarizerModel.generateContent(prompt);
-    const response = JSON.parse(result.response.text());
+    const response = parseJson(result.response.text());
     return response.summary;
 }

@@ -40,3 +40,4 @@ firebase_ai_implementation
 expo_docs
 !expo_docs/pages
 .gitignore
+.firebase

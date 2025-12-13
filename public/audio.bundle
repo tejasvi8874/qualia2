@@ -9463,7 +9463,8 @@
 
   // audioShared.ts
   var AUDIO_GENERATION_CONFIG = {
-    model: "gemini-live-2.5-flash-preview",
+    model: "gemini-2.5-flash-native-audio-preview-09-2025",
+    // model: "gemini-live-2.5-flash-preview",
     generationConfig: {
       inputAudioTranscription: {},
       outputAudioTranscription: {},
@@ -9508,7 +9509,7 @@
             callbacks.onUserPart(text);
             userTranscription.push(text);
             if (userFlushTimeout) clearTimeout(userFlushTimeout);
-            userFlushTimeout = setTimeout(flushUser, 1e3);
+            userFlushTimeout = setTimeout(flushUser, 2e3);
           }
           if (message.outputTranscription?.text) {
             flushUser();
@@ -9516,7 +9517,7 @@
             callbacks.onModelPart(text);
             modelTranscription.push(text);
             if (modelFlushTimeout) clearTimeout(modelFlushTimeout);
-            modelFlushTimeout = setTimeout(flushModel, 1e3);
+            modelFlushTimeout = setTimeout(flushModel, 2e3);
           }
           if (callbacks.onAudioData) {
             for (const part of message.modelTurn?.parts || []) {
@@ -9549,6 +9550,7 @@
   async function setupAudioSession(ai2, callbacks, systemInstruction, initialMessage = "(call started)") {
     const session = await connectAndStartAudioSession(ai2, systemInstruction);
     if (initialMessage) {
+      console.log(`intial message sent ${initialMessage}`);
       session.send(initialMessage);
     }
     processStreamMessages(session, callbacks).catch((err) => {

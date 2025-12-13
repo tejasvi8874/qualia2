@@ -1,12 +1,9 @@
 import { LiveSession } from "firebase/ai";
 import { ai } from "./firebaseAuth";
 import { createAudioPlayer } from 'expo-audio';
-
-// Parallel web implementation in audio.html
-
 import { setupAudioSession } from "./audioShared";
 
-// Parallel web implementation in audio.html
+// Parallel web implementation in audio.ts
 
 export async function startAudioSession(onTranscriptPart: (type: 'user' | 'gemini', message: string) => void, onTranscriptFlush: (type: 'user' | 'gemini' | 'ended', message: string) => void, systemInstruction?: string): Promise<LiveSession> {
     return setupAudioSession(ai, {
@@ -18,6 +15,7 @@ export async function startAudioSession(onTranscriptPart: (type: 'user' | 'gemin
         onAudioData: (base64) => {
             try {
                 const player = createAudioPlayer({ uri: `data:audio/wav;base64,${base64}` });
+                console.log("playing audio data")
                 player.play();
             } catch (error) {
                 console.error("Failed to play audio from blob URL:", error);

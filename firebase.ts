@@ -299,7 +299,7 @@ export async function runWithLock<T>(
         return result;
       } catch (e) {
         await release();
-        console.error(`Failed to release lock for ${docRef.id}: ${e}`, e instanceof Error ? e.stack : '');
+        console.error(`Releasing lock for ${docRef.id} failed: ${e}`, e instanceof Error ? e.stack : '');
         throw e;
       }
     }
