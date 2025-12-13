@@ -1,3 +1,5 @@
+import { IsoDeliveryTime } from "./types";
+
 export class LRUCache<K, V> {
   private capacity: number;
   private cache: Map<K, V>;
@@ -45,4 +47,31 @@ export function memoize<A, R>(fn: (arg: A) => Promise<R>, capacity: number, onCa
     cache.set(arg, result);
     return result;
   };
+}
+
+
+export function parseIsoDeliveryTime(isoTime: IsoDeliveryTime): Date {
+  const { year, month, day, hour, minute, second = 0, timezone } = isoTime;
+  let date: Date;
+
+  if (timezone) {
+    // Validate and construct ISO string with timezone
+    const pad = (n: number) => n.toString().padStart(2, '0');
+    const isoStringWithoutZone = `${year}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}:${pad(second)}`;
+
+    if (timezone === 'Z' || /^[+-]\d{2}:?\d{2}$/.test(timezone)) {
+      // ISO 8601 format with offset
+      date = new Date(`${isoStringWithoutZone}${timezone}`);
+    } else {
+      throw new Error(`Unsupported timezone format: ${timezone}. Must be 'Z' or ISO offset (e.g. +05:30).`);
+    }
+  } else {
+    // Local time (server local)
+    date = new Date(year, month - 1, day, hour, minute, second);
+  }
+
+  if (isNaN(date.getTime())) {
+    throw new Error("Invalid date constructed (result was NaN). Check day/month boundaries.");
+  }
+  return date;
 }

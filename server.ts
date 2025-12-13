@@ -37,7 +37,7 @@ import { ref as databaseRef, set, remove, onDisconnect } from "firebase/database
 import { getId } from "firebase/installations";
 
 import { RateLimiter, withRetry, BatchProcessor } from "./requestUtils";
-import { memoize } from "./utils";
+import { memoize, parseIsoDeliveryTime } from "./utils";
 
 export async function messageListener() {
     // We use 'in' (equality) for communicationType and '!=' (inequality) for fromQualiaId.
@@ -133,7 +133,7 @@ API Usage:
 - You do NOT need to delete children/parents when deleting a node; references will be auto-cleaned.
 
 Current Qualia:
-${ JSON.stringify(serializedGraph)}
+${JSON.stringify(serializedGraph)}
 
 Current qualia size is ${await getMaxQualiaSizePercent(qualiaDoc)}% of the limit.
 
@@ -193,7 +193,7 @@ API Usage:
 - References to deleted nodes are automatically removed from other nodes, so you don't need to manually update them.
 
 Current Qualia:
-${ JSON.stringify(serializedGraph)}
+${JSON.stringify(serializedGraph)}
 
 Qualia size is ${qualiaSizePercent}% of limit.
 
@@ -760,7 +760,7 @@ async function attemptIntegration(qualiaId: string) {
                         if (cycles) {
                             errorInfo = `Cycle detected: ${JSON.stringify(cycles)}. Please retry without creating cycles.`;
                             if (lastOperations) {
-                                errorInfo += `\nAttempted operations: ${JSON.stringify(lastOperations)}`;
+                                errorInfo += `\n\nAttempted operations: ${JSON.stringify(lastOperations)}`;
                             }
                             console.log(errorInfo);
 
@@ -931,6 +931,23 @@ async function getValidCommunication(communication: Communication): Promise<Comm
     } else if (communication.fromQualiaId !== await getUserId()) {
         errorMessage += `Invalid fromQualiaId: ${communication.fromQualiaId}. Your qualiaId is ${await getUserId()}.\n`;
     }
+
+    console.log(`Communication validated successfully: ${JSON.stringify(communication)}`);
+    communication.ack = false;
+    communication.seen = false;
+    if (communication.delaySeconds && communication.delaySeconds > 0) {
+        communication.deliveryTime = Timestamp.fromMillis(Date.now() + communication.delaySeconds * 1000);
+    } else if (communication.isoDeliveryTime) {
+        try {
+            const date = parseIsoDeliveryTime(communication.isoDeliveryTime);
+            communication.deliveryTime = Timestamp.fromDate(date);
+        } catch (e: any) {
+            errorMessage += `Invalid isoDeliveryTime: ${e.message}\n`;
+        }
+    } else {
+        communication.deliveryTime = Timestamp.now();
+    }
+
     if (errorMessage.length > 0) {
         console.error(`Error processing communication: ${errorMessage}`);
         return {
@@ -945,16 +962,7 @@ async function getValidCommunication(communication: Communication): Promise<Comm
             seen: false
         }
     }
-    console.log(`Communication validated successfully: ${JSON.stringify(communication)}`);
-    communication.ack = false;
-    communication.seen = false;
-    if (communication.delaySeconds && communication.delaySeconds > 0) {
-        communication.deliveryTime = Timestamp.fromMillis(Date.now() + communication.delaySeconds * 1000);
-    } else if (communication.isoDeliveryTime) {
-        communication.deliveryTime = Timestamp.fromDate(new Date(communication.isoDeliveryTime));
-    } else {
-        communication.deliveryTime = Timestamp.now();
-    }
+
     return communication;
 }
 

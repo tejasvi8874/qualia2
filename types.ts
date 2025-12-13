@@ -21,6 +21,16 @@ export interface Contacts {
   phoneContacts?: PhoneContact[];
 }
 
+export interface IsoDeliveryTime {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second?: number;
+  timezone?: string; // Optional: "Z", "+05:30", "-08:00". Defaults to local server time if omitted.
+}
+
 export interface Communication {
   id?: string;
   fromQualiaName: string;
@@ -40,7 +50,7 @@ export interface Communication {
   delaySeconds?: number;
   deliveryTime?: Timestamp;
   receivedTime?: Timestamp;
-  isoDeliveryTime?: string;
+  isoDeliveryTime?: IsoDeliveryTime;
 }
 
 import { FUNCTION_NAMES } from "./functions/src/shared";
@@ -65,7 +75,18 @@ export const COMMUNICATION_SCHEMA = Schema.object({
           message: Schema.string(),
           context: Schema.string(),
           delaySeconds: Schema.number(),
-          isoDeliveryTime: Schema.string(),
+          isoDeliveryTime: Schema.object({
+            properties: {
+              year: Schema.number({ description: "Full year (e.g. 2023)" }),
+              month: Schema.number({ description: "Month (1-12)" }),
+              day: Schema.number({ description: "Day of month (1-31)" }),
+              hour: Schema.number({ description: "Hour (0-23)" }),
+              minute: Schema.number({ description: "Minute (0-59)" }),
+              second: Schema.number({ description: "Second (0-59)" }),
+              timezone: Schema.string({ description: "Timezone offset (e.g. 'Z', '+05:30', '-08:00'). Defaults to local server time if omitted." }),
+            },
+            optionalProperties: ["second", "timezone"],
+          }),
         },
         propertyOrdering: [
           "context",
@@ -135,11 +156,11 @@ export interface QualiaDoc {
 
 export const INTEGRATION_SCHEMA = Schema.object({
   properties: {
-    reasoning: Schema.string({ description: "Optional reasoning for the batch of operations. WARNING: This is ephemeral and will not be stored." }),
+    reasoning: Schema.string({ description: "Optional ephemeral reasoning for the batch of operations." }),
     operations: Schema.array({
       items: Schema.object({
         properties: {
-          reasoning: Schema.string({ description: "Optional scratch place to think about the operation. WARNING: This is ephemeral and will not be stored." }),
+          reasoning: Schema.string({ description: "Optional ephemeral scratch place to think about the operation." }),
           id: Schema.string({ description: "Unique ID of the conclusion to create or update." }),
           newConclusion: Schema.string({ description: "The new content. If set to empty string (\"\"), the conclusion will be DELETED. If omitted, conclusion text remains unchanged." }),
           addAssumptions: Schema.array({ items: Schema.string(), description: "List of assumption IDs to ADD to this conclusion. If omitted, no assumptions are added." }),
