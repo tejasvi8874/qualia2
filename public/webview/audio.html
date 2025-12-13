@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<!-- Parallel mobile implementation in audioSession.ts -->
+<html>
+<head>
+    <title>Audio Session</title>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-ai-compat.js"></script>
+</head>
+<body>
+    <script>
+        // This script is self-contained and runs inside the native WebView.
+        // It receives the firebaseConfig via injection from App.tsx.
+        firebase.initializeApp(firebaseConfig);
+        const auth = firebase.auth();
+        const ai = firebase.ai();
+
+        let liveSession;
+
+        async function startAudioConversation() {
+            const model = ai.getLiveGenerativeModel({
+                model: "gemini-live-2.5-flash-preview",
+                generationConfig: {
+                    inputAudioTranscription: {},
+                    outputAudioTranscription: {},
+                    responseModalities: ["AUDIO"],
+                    speechConfig: {
+                        voiceConfig: {
+                            prebuiltVoiceConfig: {
+                                voiceName: "Aoede"
+                            }
+                        }
+                    },
+                }
+            });
+
+            liveSession = await model.connect();
+            // Note: In the WebView, we don't need the controller return value.
+            await ai.startAudioConversation(liveSession);
+            receiveMessages(liveSession);
+        }
+
+        async function receiveMessages(session) {
+            const messageStream = session.receive();
+            const userTranscription = [];
+            const modelTranscription = [];
+            let userFlushTimeout = null;
+            let modelFlushTimeout = null;
+
+            const postMessage = (type, message) => {
+                window.ReactNativeWebView.postMessage(JSON.stringify({ type, message }));
+            };
+
+            const flushUser = () => {
+                if (userFlushTimeout) clearTimeout(userFlushTimeout);
+                userFlushTimeout = null;
+                if (userTranscription.length > 0) {
+                    postMessage('user', userTranscription.join(""));
+                    userTranscription.length = 0;
+                }
+            };
+            const flushModel = () => {
+                if (modelFlushTimeout) clearTimeout(modelFlushTimeout);
+                modelFlushTimeout = null;
+                if (modelTranscription.length > 0) {
+                    postMessage('gemini', modelTranscription.join(""));
+                    modelTranscription.length = 0;
+                }
+            };
+
+            try {
+                for await (const message of messageStream) {
+                    if (message.type === 'serverContent') {
+                        if (message.inputTranscription?.text) {
+                            flushModel();
+                            userTranscription.push(message.inputTranscription.text);
+                            if (userFlushTimeout) clearTimeout(userFlushTimeout);
+                            userFlushTimeout = setTimeout(flushUser, 1000);
+                        }
+                        if (message.outputTranscription?.text) {
+                            flushUser();
+                            modelTranscription.push(message.outputTranscription.text);
+                            if (modelFlushTimeout) clearTimeout(modelFlushTimeout);
+                            modelFlushTimeout = setTimeout(flushModel, 1000);
+                        }
+                        if (message.turnComplete) {
+                            flushUser();
+                            flushModel();
+                        }
+                    }
+                }
+            } finally {
+                flushUser();
+                flushModel();
+                postMessage('ended', '');
+            }
+        }
+
+        window.addEventListener('message', event => {
+            if (event.data === 'start') {
+                startAudioConversation();
+            } else if (event.data === 'stop') {
+                if (liveSession) {
+                    liveSession.close();
+                }
+            }
+        });
+    </script>
+</body>
+</html>

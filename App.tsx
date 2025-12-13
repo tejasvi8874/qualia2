@@ -19,6 +19,7 @@ import {
 } from "react-native";
 // Import SafeAreaProvider to use in the root and within the Modal
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import { WebView } from "react-native-webview";
 import { sendMessage, registerClientMessageClb, getContacts, updateContacts } from "./firebaseClientUtils";
 import { Communications, Communication, ContextQualia } from "./types";
 import { Timestamp } from "firebase/firestore";
@@ -26,9 +27,11 @@ import { getUserId } from "./firebase";
 import { messageListener } from "./server";
 import { auth } from "./firebaseAuth";
 import { signInAnonymously, linkWithPhoneNumber, RecaptchaVerifier, signInWithPhoneNumber } from "firebase/auth";
-import { getLiveGenerativeModel, startAudioConversation, AudioConversationController, LiveSession, LiveGenerativeModel } from "firebase/ai";
 import { ai } from "./firebaseAuth";
 import * as FileSystem from "expo-file-system";
+import { firebaseConfig } from "./firebaseConfig";
+import { startAudioSession } from "./audioSession";
+import { LiveSession } from "firebase/ai";
 
 declare global {
   interface Window {
@@ -176,10 +179,11 @@ const MessageItem = React.memo(function MessageItem({
   // Handle Standard Message
 
   // Stylize thoughts (when applicable) as italics and slightly dim enclosed in parentheses.
+  const text = item.text.trim();
   const displayText =
     shouldUseThoughtStyle && !item.text.startsWith("(")
-      ? `(${item.text})`
-      : item.text;
+      ? `(${text})`
+      : text;
 
   return (
     <View style={styles.messageContainer}>
@@ -331,6 +335,7 @@ const QualiaSwitcher = ({
 // --- Main App Component ---
 
 const AppContent = () => {
+  const lastTranscriptType = useRef<'user' | 'gemini' | 'ended' | null>(null);
   const colorScheme = useColorScheme();
   const theme = useMemo(() => getTheme(colorScheme), [colorScheme]);
 
@@ -347,8 +352,8 @@ const AppContent = () => {
   const [userQualia, setUserQualia] = useState<ContextQualia | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
   const [isCalling, setIsCalling] = useState(false);
-  const [audioController, setAudioController] = useState<AudioConversationController | null>(null);
-  const liveSessionRef = useRef<LiveSession | null>(null);
+  const webviewRef = useRef<WebView>(null);
+  const [liveSession, setLiveSession] = useState<LiveSession | null>(null);
 
   useEffect(() => {
     const unsubscribe = auth.onAuthStateChanged((user) => {
@@ -409,110 +414,42 @@ const AppContent = () => {
     setIsSwitcherVisible(false);
   }, []);
 
-  async function stopRecording() {
-    if (!audioController) {
-      return;
-    }
-    await audioController.stop();
-    setAudioController(null);
-    if (liveSessionRef.current) {
-      liveSessionRef.current.close();
-      liveSessionRef.current = null;
-    }
-  }
-
   const handleCall = async () => {
     if (isCalling) {
       console.log("Ending call.");
-      addMessage("(Call ended)", "ui");
-      await stopRecording();
+      if (Platform.OS === 'web') {
+        if (liveSession) {
+          liveSession.close();
+        }
+      } else {
+        webviewRef.current?.postMessage('stop');
+      }
     } else {
       console.log("Starting call.");
       addMessage("(Call started)", "ui");
-      const model = getLiveGenerativeModel(ai, {
-        model: "gemini-2.0-flash-live-001", // Do not change
-        generationConfig: {
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          responseModalities: ["AUDIO"],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: "Aoede"
-              }
-            }
+      setIsCalling(true);
+      if (Platform.OS === 'web') {
+        const session = await startAudioSession(
+          (type, text) => { // onTranscriptPart
+            const isContinuing = lastTranscriptType.current === type;
+            addMessage(text, type, { appendToLast: isContinuing });
+            lastTranscriptType.current = type;
           },
-        }
-      });
-      const session = await model.connect();
-      liveSessionRef.current = session;
-      const controller = await startAudioConversation(session);
-      setAudioController(controller);
-      receiveMessages(session);
-    }
-    setIsCalling(!isCalling);
-  };
-
-  const receiveMessages = async (liveSession: LiveSession) => {
-    const messageStream = liveSession.receive();
-    const userTranscription: string[] = [];
-    const modelTranscription: string[] = [];
-
-    const flushUser = () => {
-      if (userTranscription.length > 0) {
-        addMessage(userTranscription.join(""), "user");
-        userTranscription.length = 0;
-      }
-    };
-    const flushModel = () => {
-      if (modelTranscription.length > 0) {
-        addMessage(modelTranscription.join(""), "gemini");
-        modelTranscription.length = 0;
-      }
-    };
-
-    try {
-      for await (const message of messageStream) {
-        if (message.type === 'serverContent') {
-          if (message.inputTranscription?.text) {
-            flushModel();
-            userTranscription.push(message.inputTranscription.text);
-          }
-          if (message.outputTranscription?.text) {
-            flushUser();
-            modelTranscription.push(message.outputTranscription.text);
-          }
-
-          if (message.turnComplete) {
-            flushUser();
-            flushModel();
-          }
-
-          if (message.modelTurn) {
-            for (const part of message.modelTurn.parts) {
-              if ("inlineData" in part && part.inlineData) {
-                if (message.outputTranscription?.text) console.log("Model output", message.outputTranscription?.text);
-              }
+          (type, text) => { // onTranscriptFlush
+            if (type === 'ended') {
+              setIsCalling(false);
+              setLiveSession(null);
+              addMessage("(Call ended)", "ui");
+              lastTranscriptType.current = null;
+            } else {
+              lastTranscriptType.current = null;
+              // In future, send `text` to qualia.
             }
           }
-
-          const logMessage = JSON.parse(JSON.stringify(message));
-          if (logMessage.modelTurn) {
-            for (const part of logMessage.modelTurn.parts) {
-              if ("inlineData" in part && part.inlineData) {
-                part.inlineData.data = part.inlineData.data.substring(0, 100);
-              }
-            }
-          }
-          console.log(JSON.stringify(logMessage));
-        }
-      }
-    } finally {
-      if (isCalling) {
-        console.log("Live session closed.");
-        addMessage("(Call ended)", "ui");
-        setIsCalling(false);
-        setAudioController(null);
+        );
+        setLiveSession(session);
+      } else {
+        webviewRef.current?.postMessage('start');
       }
     }
   };
@@ -541,9 +478,14 @@ const AppContent = () => {
 
   // --- Message Management ---
   // Adds a message to the history, ensuring the context (activeQualia at the time) is stored.
+  // Adds a message to the history, ensuring the context (activeQualia at the time) is stored.
+  // New: optional third parameter `prependIfMatch` will, when true, prepend the new text
+  // onto the last message if that message has the same isThought/contextId/contextName.
   const addMessage = useCallback(
-    (text: string, fromQualiaId: string) => {
+    (text: string, fromQualiaId: string, options: { appendToLast?: boolean } = {}) => {
       if (!activeQualia) return;
+      if (text.length === 0) return;
+
       const isThought = fromQualiaId !== activeQualia.id;
       const newMessage: Message = {
         id: Date.now().toString() + Math.random(),
@@ -552,7 +494,23 @@ const AppContent = () => {
         contextId: activeQualia.id,
         contextName: activeQualia.name,
       };
-      setMessages((prevMessages) => [...prevMessages, newMessage]);
+
+      setMessages((prevMessages) => {
+        if (options.appendToLast && prevMessages.length > 0) {
+          const last = prevMessages[prevMessages.length - 1];
+
+          const { id: lastId, text: lastText, ...lastRest } = last;
+          const { id: newId, text: newText, ...newRest } = newMessage;
+
+          if (JSON.stringify(lastRest) === JSON.stringify(newRest)) {
+            const mergedText = last.text + newMessage.text;
+            const mergedMessage = { ...last, text: mergedText };
+            return [...prevMessages.slice(0, -1), mergedMessage];
+          }
+        }
+
+        return [...prevMessages, newMessage];
+      });
     },
     [activeQualia],
   );
@@ -898,6 +856,25 @@ const AppContent = () => {
         onSignOut={handleSignOut}
       />
       <View nativeID="sign-in-button" />
+      {Platform.OS !== 'web' && userQualia && (
+        <WebView
+          ref={webviewRef}
+          style={{ display: 'none' }}
+          source={require('./public/webview/audio.html')}
+          injectedJavaScript={`const firebaseConfig = ${JSON.stringify(firebaseConfig)};`}
+          onMessage={(event) => {
+            const data = JSON.parse(event.nativeEvent.data);
+            if (data.type === 'user') {
+              addMessage(data.message, 'user');
+            } else if (data.type === 'gemini') {
+              addMessage(data.message, 'gemini');
+            } else if (data.type === 'ended') {
+              setIsCalling(false);
+              addMessage("(Call ended)", "ui");
+            }
+          }}
+        />
+      )}
     </SafeAreaView>
   );
 };
