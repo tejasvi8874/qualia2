@@ -30,7 +30,7 @@ export interface Communication {
   message: string;
   // Instead of boolean, it is status enum
   ack: boolean;
-  seen?: boolean;
+  seen: boolean;
   processingBefore?: Timestamp;
   reasoning?: string;
   fromQualiaId: string;

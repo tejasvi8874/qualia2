@@ -523,7 +523,7 @@ async function getValidCommunication(communication: Communication): Promise<Comm
     console.log(`Validating communication: ${JSON.stringify(communication)}`);
     let errorMessage = "";
     communication.communicationType = communication.communicationType.trim() as Communication["communicationType"];
-    if (communication.communicationType === "HUMAN_TO_QUALIA") {
+    if (communication.communicationType === "QUALIA_TO_HUMAN") {
         if (communication.fromQualiaId === undefined) {
             communication.fromQualiaId = await getUserId();
         } else if (communication.fromQualiaId !== await getUserId()) {
@@ -593,10 +593,12 @@ async function getValidCommunication(communication: Communication): Promise<Comm
             communicationType: "QUALIA_TO_QUALIA",
             deliveryTime: Timestamp.now(),
             ack: false,
+            seen: false
         }
     }
     console.log(`Communication validated successfully: ${JSON.stringify(communication)}`);
     communication.ack = false;
+    communication.seen = false;
     if (communication.delaySeconds && communication.delaySeconds > 0) {
         communication.deliveryTime = Timestamp.fromMillis(Date.now() + communication.delaySeconds * 1000);
     } else if (communication.isoDeliveryTime) {
