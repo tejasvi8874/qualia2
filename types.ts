@@ -135,19 +135,18 @@ export interface QualiaDoc {
 
 export const INTEGRATION_SCHEMA = Schema.object({
   properties: {
-    reasoning: Schema.string(),
+    reasoning: Schema.string({ description: "Optional reasoning for the batch of operations. WARNING: This is ephemeral and will not be stored." }),
     operations: Schema.array({
       items: Schema.object({
         properties: {
-          reasoning: Schema.string({ description: "Optional scratch place to think about the operation." }),
-          type: Schema.enumString({ enum: ["CREATE", "DELETE"], description: "Type of operation." }),
-          createId: Schema.string({ description: "Unique ID for the new conclusion. Required for CREATE." }),
-          conclusion: Schema.string({ description: "The content of the new conclusion. Required for CREATE." }),
-          assumptions: Schema.array({ items: Schema.string(), description: "List of IDs of existing conclusions to be used as assumptions for the new conclusion. Required for CREATE." }),
-          deleteIdsPathTillRoot: Schema.array({ items: Schema.string(), description: "Path of conclusion IDs to delete which must include root conclusion. Required for DELETE. If an assumption or conclusion is deleted, recursively all its parent conclusions must also be deleted till the root conclusion. Recreate the updated conclusions with appropriate assumptions if needed." }),
+          reasoning: Schema.string({ description: "Optional scratch place to think about the operation. WARNING: This is ephemeral and will not be stored." }),
+          id: Schema.string({ description: "Unique ID of the conclusion to create or update." }),
+          newConclusion: Schema.string({ description: "The new content. If set to empty string (\"\"), the conclusion will be DELETED. If omitted, conclusion text remains unchanged." }),
+          addAssumptions: Schema.array({ items: Schema.string(), description: "List of assumption IDs to ADD to this conclusion. If omitted, no assumptions are added." }),
+          removeAssumptions: Schema.array({ items: Schema.string(), description: "List of assumption IDs to REMOVE from this conclusion. If omitted, no assumptions are removed." }),
         },
-        propertyOrdering: ["reasoning", "type", "createId", "conclusion", "assumptions", "deleteIdsPathTillRoot"],
-        optionalProperties: ["reasoning", "createId", "conclusion", "assumptions", "deleteIdsPathTillRoot"],
+        propertyOrdering: ["reasoning", "id", "newConclusion", "addAssumptions", "removeAssumptions"],
+        optionalProperties: ["reasoning", "newConclusion", "addAssumptions", "removeAssumptions"],
       }),
     }),
   },
@@ -157,11 +156,10 @@ export const INTEGRATION_SCHEMA = Schema.object({
 
 export interface IntegrationOperation {
   reasoning?: string;
-  type: "CREATE" | "DELETE";
-  createId?: string;
-  conclusion?: string;
-  assumptions?: string[];
-  deleteIdsPathTillRoot?: string[];
+  id: string;
+  newConclusion?: string;
+  addAssumptions?: string[];
+  removeAssumptions?: string[];
 }
 
 export interface IntegrationResponse {

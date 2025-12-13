@@ -203,92 +203,105 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
     }
 
     const newDoc = { ...doc, nodes: { ...doc.nodes } };
-    const createdNodeIds = new Set<string>();
     const errors: string[] = [];
-
-    // Simple Base64 UUID generator (22 chars, ~132 bits of entropy)
-    const generateId = () => {
-        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-        let result = '';
-        for (let i = 0; i < 22; i++) {
-            result += chars.charAt(Math.floor(Math.random() * chars.length));
-        }
-        return result;
-    };
+    const deletedNodeIds = new Set<string>();
 
     for (const op of operations) {
-        if (op.type === "CREATE") {
-            if (!op.createId) {
-                errors.push(`CREATE operation missing createId`);
-                continue;
-            }
-            const id = op.createId;
+        const id = op.id;
 
-            // Check for collision with existing nodes
+        // DELETE Operation
+        if (op.newConclusion === "") {
             if (newDoc.nodes[id]) {
-                const existingNode = newDoc.nodes[id];
-                errors.push(
-                    `CREATE operation failed: Conclusion with ID ${id} already exists. Existing conclusion content: ${existingNode.conclusion}`
-                );
+                delete newDoc.nodes[id];
+                deletedNodeIds.add(id);
+            } else if (deletedNodeIds.has(id)) {
+                // Idempotent delete: Already deleted in this batch, ignore.
+                continue;
+            } else {
+                // ID doesn't exist and wasn't deleted in this batch -> Error (Typo or Invalid ID)
+                errors.push(`DELETE operation refers to non-existent ID: ${id}`);
+                continue;
+            }
+            continue;
+        }
+
+        // CREATE or UPDATE Operation
+        let node = newDoc.nodes[id];
+
+        if (!node) {
+            // CREATE
+            if (!op.newConclusion) {
+                errors.push(`Operation on non-existent ID ${id} requires 'newConclusion' to be set (entry creation).`);
                 continue;
             }
 
-            // Assumptions are used directly as provided by LLM
-            const resolvedAssumptions = op.assumptions || [];
-
-            // Validate conclusion is non-empty
-            if (!op.conclusion || op.conclusion.trim() === "") {
-                errors.push(`CREATE operation with id ${id} has empty conclusion`);
-                continue;
-            }
-
-            const newNode: QualiaNode = {
+            node = {
                 id: id,
-                conclusion: op.conclusion,
-                assumptionIds: resolvedAssumptions,
+                conclusion: op.newConclusion,
+                assumptionIds: [],
                 timestamp: Timestamp.now()
             };
-            newDoc.nodes[newNode.id] = newNode;
-            createdNodeIds.add(newNode.id);
-        } else if (op.type === "DELETE") {
-            if (!op.deleteIdsPathTillRoot || op.deleteIdsPathTillRoot.length === 0) {
-                errors.push(`DELETE operation missing deleteIdsPathTillRoot`);
-                continue;
+            newDoc.nodes[id] = node;
+        } else {
+            // UPDATE
+            if (op.newConclusion) {
+                node.conclusion = op.newConclusion;
             }
+            // We update the object in place (it's a copy of the map, but not deep copy of nodes?
+            // Wait, { ...doc.nodes } is shallow copy of map. The values are references.
+            // We should clone the node to be safe/immutable.
+            newDoc.nodes[id] = { ...node };
+            node = newDoc.nodes[id];
+        }
 
-            for (const idToDelete of op.deleteIdsPathTillRoot) {
-                if (!newDoc.nodes[idToDelete]) {
-                    errors.push(`DELETE operation refers to non-existent ID: ${idToDelete}`);
-                    continue;
-                }
-                delete newDoc.nodes[idToDelete];
+        // Apply assumption changes
+        const currentAssumptions = new Set(node.assumptionIds);
+
+        // Remove assumptions
+        if (op.removeAssumptions) {
+            for (const removeId of op.removeAssumptions) {
+                currentAssumptions.delete(removeId);
+            }
+        }
+
+        // Add assumptions
+        if (op.addAssumptions) {
+            for (const addId of op.addAssumptions) {
+                currentAssumptions.add(addId);
+            }
+        }
+
+        node.assumptionIds = Array.from(currentAssumptions);
+    }
+
+    // Auto-cleanup references to deleted nodes from OTHER nodes
+    // This makes deletion "flexible" and "safe"
+    if (deletedNodeIds.size > 0) {
+        for (const nodeId of Object.keys(newDoc.nodes)) {
+            const node = newDoc.nodes[nodeId];
+            const originalLength = node.assumptionIds.length;
+            const newAssumptions = node.assumptionIds.filter(aId => !deletedNodeIds.has(aId));
+
+            if (newAssumptions.length !== originalLength) {
+                // Determine if we need to clone (if we haven't already touched this node)
+                // Since we don't track which nodes we touched easily, we can just overwrite
+                newDoc.nodes[nodeId] = {
+                    ...node,
+                    assumptionIds: newAssumptions
+                };
             }
         }
     }
 
-    // Validation: Check ALL nodes for missing assumptions, not just created ones.
-    // Since we might have deleted assumptions of existing nodes.
+    // Final Validation: Check for missing assumptions
+    // This catches if we added an assumption that doesn't exist, or if we kept an assumption that was deleted (though auto-cleanup handles that).
+    // Or if previous corruption existed.
     for (const node of Object.values(newDoc.nodes)) {
         for (const assumptionId of node.assumptionIds) {
             if (!newDoc.nodes[assumptionId]) {
-                // This catches the case where we deleted an assumption but didn't delete the parent.
-                const ancestors = getAllAncestors(newDoc.nodes, node.id);
-                const idsToDelete = [node.id, ...ancestors];
                 errors.push(
-                    `The deleted assumption ${assumptionId} has an undeleted parent conclusion ${node.id}. You must remove the parent conclusion ${node.id} and all its ancestor conclusions. Therefore all the IDs in [${idsToDelete.join(", ")}] have to be deleted and created anew if required.`
+                    `Conclusion ${node.id} refers to missing assumption ${assumptionId}.`
                 );
-            }
-        }
-    }
-
-    // Validation: Check newly created nodes
-    for (const id of createdNodeIds) {
-        const node = newDoc.nodes[id];
-        if (node) {
-            for (const assumptionId of node.assumptionIds) {
-                if (!newDoc.nodes[assumptionId]) {
-                    errors.push(`The ID ${assumptionId} used as an assumption for conclusion ${node.id} does not exist`);
-                }
             }
         }
     }

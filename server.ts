@@ -106,7 +106,12 @@ const getMaxQualiaSizePercent = memoize(async (qualiaDoc: QualiaDoc) => {
 
 async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunications: Communication[], errorInfo?: string): Promise<IntegrationResponse> {
     const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
-    let prompt = `Integrate pending communications into the qualia by performing a series of operations on the graph. Current qualia size is ${await getMaxQualiaSizePercent(qualiaDoc)}% of the limit.:
+    let prompt = `Integrate pending communications into the qualia. Current qualia size is ${await getMaxQualiaSizePercent(qualiaDoc)}% of the limit.
+API Usage:
+- To CREATE a new conclusion, specify a unique 'id' and 'newConclusion' text.
+- To UPDATE an existing conclusion, specify its 'id' and provide 'newConclusion', 'addAssumptions', or 'removeAssumptions' as needed. Omitted fields remain unchanged.
+- To DELETE a conclusion, specify its 'id' and set 'newConclusion' to empty string (""). Explicitly deleting a node is NOT required if you just want to update it.
+- You do NOT need to delete children/parents when deleting a node; references will be auto-cleaned.
 
 ${JSON.stringify(serializedQualia)}`;
     if (errorInfo) {
@@ -157,7 +162,12 @@ async function performCompaction(qualiaDocRef: DocumentReference, lockOwnerId: s
             .filter(c => c.id && !integratedCommunicationIds.has(c.id));
 
         const serializedQualia = serializeQualia(qualiaDoc, currentPending);
-        const prompt = `Qualia size is ${qualiaSizePercent}% of limit. Integrate pending communications AND perform DELETE operations to reduce size:\n${JSON.stringify({ qualia: serializedQualia })}`;
+        const prompt = `Qualia size is ${qualiaSizePercent}% of limit. Integrate pending communications AND perform DELETE operations (by setting newConclusion to "") to reduce size.
+API Usage:
+- To DELETE a conclusion, specify its 'id' and set 'newConclusion' to empty string ("").
+- References to deleted nodes are automatically removed from other nodes, so you don't need to manually update them.
+
+${JSON.stringify({ qualia: serializedQualia })}`;
 
         let ops: IntegrationResponse | undefined;
         let errorInfo: string | undefined;
