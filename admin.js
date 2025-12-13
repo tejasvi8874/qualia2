@@ -972,6 +972,190 @@ async function populateCreatedTime(dryRun = true) {
 }
 
 // Example usage:
-// deleteNewQualiaDocs("2025-11-29T23:00:13.088Z", true);
-// Example usage:
 // populateCreatedTime(false);
+
+/**
+ * Finds the point in time where qualia docs significantly reduced in size.
+ * 
+ * @param {string} qualiaId - The qualia ID to analyze (default: '1MM1DDZnDmXnn0GBB4oBGoRqKaD2')
+ */
+async function findHugeDiff(qualiaId = '1MM1DDZnDmXnn0GBB4oBGoRqKaD2') {
+  try {
+    console.log(`Analyzing qualia docs for size reduction event for ${qualiaId}...`);
+
+    const qualiaDocsRef = db.collection('qualiaDocs');
+    const snapshot = await qualiaDocsRef.where('qualiaId', '==', qualiaId).get();
+
+    if (snapshot.empty) {
+      console.log('No qualia docs found.');
+      return;
+    }
+
+    const docs = snapshot.docs.map(doc => ({
+      id: doc.id,
+      createTime: doc.createTime.toDate(),
+      nodeCount: doc.data().nodes ? Object.keys(doc.data().nodes).length : 0,
+      data: doc.data()
+    }));
+
+    // Sort by createTime descending (newest first)
+    docs.sort((a, b) => b.createTime - a.createTime);
+
+    console.log(`Analyzed ${docs.length} docs.`);
+
+    for (let i = 0; i < docs.length - 1; i++) {
+      const currentDoc = docs[i]; // Newer
+      const olderDoc = docs[i + 1]; // Older
+
+      const diff = olderDoc.nodeCount - currentDoc.nodeCount;
+
+      // Threshold: Drop of more than 50 nodes or 20% reduction
+      if (diff > 50 || (olderDoc.nodeCount > 0 && diff / olderDoc.nodeCount > 0.2)) {
+        console.log('\n!!! FOUND SIGNIFICANT SIZE REDUCTION !!!');
+        console.log(`Event detected between:`);
+        console.log(`  [Older/Large] ID: ${olderDoc.id}, Created: ${olderDoc.createTime.toISOString()}, Nodes: ${olderDoc.nodeCount}`);
+        console.log(`  [Newer/Small] ID: ${currentDoc.id}, Created: ${currentDoc.createTime.toISOString()}, Nodes: ${currentDoc.nodeCount}`);
+        console.log(`  Difference: -${diff} nodes`);
+
+        return olderDoc.id;
+      }
+    }
+
+    console.log('No significant size reduction found.');
+    return null;
+
+  } catch (error) {
+    console.error('Error finding huge diff:', error);
+    return null;
+  }
+}
+
+/**
+ * Cleans up qualia docs by deleting all docs newer than the specified "last large doc"
+ * and marking that doc as the current one.
+ * 
+ * @param {string} lastLargeDocId - The ID of the last known good (large) document
+ * @param {boolean} dryRun - If true, only lists actions without performing them
+ */
+async function cleanupQualiaDocs(lastLargeDocId, dryRun = true) {
+  try {
+    if (!lastLargeDocId) {
+      console.error('No lastLargeDocId provided.');
+      return;
+    }
+
+    console.log(`${dryRun ? '[DRY RUN] ' : ''}Starting cleanup based on Last Large Doc ID: ${lastLargeDocId}...`);
+
+    const docRef = db.collection('qualiaDocs').doc(lastLargeDocId);
+    const lastLargeDoc = await docRef.get();
+
+    if (!lastLargeDoc.exists) {
+      console.error('Last large doc does not exist.');
+      return;
+    }
+
+    const cutoffTime = lastLargeDoc.createTime.toDate();
+    const qualiaId = lastLargeDoc.data().qualiaId;
+
+    console.log(`Cutoff Time: ${cutoffTime.toISOString()}`);
+
+    // Find all docs newer than the cutoff for this qualiaId
+    const qualiaDocsRef = db.collection('qualiaDocs');
+    const snapshot = await qualiaDocsRef.where('qualiaId', '==', qualiaId).get();
+
+    const docsToDelete = snapshot.docs.filter(doc => doc.createTime.toDate() > cutoffTime);
+
+    console.log(`Found ${docsToDelete.length} newer docs to delete.`);
+
+    if (dryRun) {
+      console.log('\nActions to be performed:');
+      console.log(`1. UPDATE doc ${lastLargeDocId} set nextQualiaDocId = ""`);
+      console.log(`2. DELETE ${docsToDelete.length} documents:`);
+      docsToDelete.sort((a, b) => a.createTime.toDate() - b.createTime.toDate()).forEach(doc => {
+        console.log(`   - Delete ID: ${doc.id} (Created: ${doc.createTime.toDate().toISOString()}, Nodes: ${Object.keys(doc.data().nodes || {}).length})`);
+      });
+      console.log('\nRun with dryRun = false to execute.');
+      return;
+    }
+
+    // 1. Update the last large doc
+    await docRef.update({ nextQualiaDocId: '' });
+    console.log(`Updated ${lastLargeDocId} nextQualiaDocId to empty.`);
+
+    // 2. Delete newer docs
+    const batchSize = 500;
+    let deletedCount = 0;
+
+    for (let i = 0; i < docsToDelete.length; i += batchSize) {
+      const batch = db.batch();
+      const chunk = docsToDelete.slice(i, i + batchSize);
+
+      chunk.forEach(doc => {
+        batch.delete(doc.ref);
+      });
+
+      await batch.commit();
+      deletedCount += chunk.length;
+      console.log(`Deleted batch of ${chunk.length} docs.`);
+    }
+
+    console.log(`Cleanup complete. Deleted ${deletedCount} documents.`);
+
+  } catch (error) {
+    console.error('Error cleaning up qualia docs:', error);
+  }
+}
+
+/**
+ * Verifies the state of qualia docs after cleanup.
+ * Checks if the last large doc is still large and if there are any newer docs remaining.
+ */
+async function verifyDamage(lastLargeDocId = 'PPFirvKepCqVi6LADBTZ') {
+  try {
+    console.log(`Verifying damage/status for Last Large Doc ID: ${lastLargeDocId}...`);
+
+    const docRef = db.collection('qualiaDocs').doc(lastLargeDocId);
+    const lastLargeDoc = await docRef.get();
+
+    if (!lastLargeDoc.exists) {
+      console.error('CRITICAL: Last large doc DOES NOT EXIST! It might have been deleted.');
+      return;
+    }
+
+    const data = lastLargeDoc.data();
+    const nodeCount = data.nodes ? Object.keys(data.nodes).length : 0;
+    console.log(`Last Large Doc (${lastLargeDocId}):`);
+    console.log(`  Created: ${lastLargeDoc.createTime.toDate().toISOString()}`);
+    console.log(`  Nodes: ${nodeCount}`);
+    console.log(`  NextQualiaDocId: "${data.nextQualiaDocId}" (Should be empty)`);
+
+    if (nodeCount < 100) {
+      console.warn('WARNING: Last large doc has a low node count! It might have been overwritten or is the wrong doc.');
+    }
+
+    const cutoffTime = lastLargeDoc.createTime.toDate();
+    const qualiaId = data.qualiaId;
+
+    // Check for newer docs
+    const qualiaDocsRef = db.collection('qualiaDocs');
+    const snapshot = await qualiaDocsRef.where('qualiaId', '==', qualiaId).get();
+
+    const newerDocs = snapshot.docs.filter(doc => doc.createTime.toDate() > cutoffTime);
+
+    console.log(`\nFound ${newerDocs.length} documents newer than the Last Large Doc.`);
+
+    if (newerDocs.length > 0) {
+      console.log('Newer docs details:');
+      newerDocs.sort((a, b) => a.createTime.toDate() - b.createTime.toDate()).forEach(doc => {
+        const nc = doc.data().nodes ? Object.keys(doc.data().nodes).length : 0;
+        console.log(`  ID: ${doc.id}, Created: ${doc.createTime.toDate().toISOString()}, Nodes: ${nc}`);
+      });
+    }
+
+  } catch (error) {
+    console.error('Error verifying damage:', error);
+  }
+}
+
+// Execute verification
+verifyDamage();

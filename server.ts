@@ -32,7 +32,7 @@ import { getContacts, getQualia } from "./firebaseClientUtils";
 import { ai, db, rtdb, installations } from "./firebaseAuth";
 import { ref as databaseRef, set, remove, onDisconnect } from "firebase/database";
 import { getId } from "firebase/installations";
-import { BASE_QUALIA } from "./constants";
+
 import { RateLimiter, withRetry } from "./requestUtils";
 
 export async function messageListener() {
@@ -104,6 +104,8 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
 
     const THRESHOLD = 10000; // Example threshold
 
+    const executedSteps: { logRef: DocumentReference }[] = [];
+
     while (serializedSize > THRESHOLD) {
         console.log(`Qualia size ${serializedSize} exceeds threshold ${THRESHOLD}. Triggering integration/reduction.`);
 
@@ -114,6 +116,8 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
 
         let ops: IntegrationResponse | undefined;
         let errorInfo: string | undefined;
+        let lastOperations: IntegrationOperation[] | undefined;
+        let currentLogRef: DocumentReference | undefined;
 
         // Retry loop for validation/cycles
         while (true) {
@@ -121,13 +125,33 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
                 const currentPrompt = errorInfo ? prompt + `\n\nPrevious attempt failed:\n\n${errorInfo}` : prompt;
                 const result = await integrationModel.generateContent(currentPrompt);
                 ops = JSON.parse(result.response.text()) as IntegrationResponse;
+                lastOperations = ops.operations;
+
+                // Log operations immediately
+                currentLogRef = await logQualiaOperation(
+                    qualiaDoc.qualiaId,
+                    lastOperations,
+                    currentPending.map(c => c.id).filter((id): id is string => !!id),
+                    undefined, // qualiaDocId: New doc not created yet, will be updated later
+                    undefined, // error: No error yet
+                    ops.reasoning
+                );
 
                 const newDoc = applyOperations(qualiaDoc, ops.operations);
+
+                // Safety Check: Prevent significant size reduction (> 50%)
+                if (currentLogRef) {
+                    await validateSizeReduction(qualiaDoc, newDoc, currentLogRef);
+                }
 
                 const cycles = detectCycles(newDoc);
                 if (cycles) {
                     errorInfo = `Cycle detected: ${JSON.stringify(cycles)}. Please retry without creating cycles.`;
                     console.log(errorInfo);
+
+                    // Update log with error
+                    await updateQualiaOperationLog(currentLogRef, { error: errorInfo });
+
                     continue;
                 }
 
@@ -139,16 +163,31 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
                 // Base graph corruption - fail permanently
                 if (e instanceof BaseGraphCorruptionError) {
                     console.error("Base graph corruption during compaction:", e.message);
+                    if (currentLogRef) {
+                        await updateQualiaOperationLog(currentLogRef, { error: `Base graph corruption: ${e.message}` });
+                    }
                     throw e;
                 }
                 // Operation validation errors - retry with context
                 if (e instanceof GraphValidationError) {
                     errorInfo = e.message;
                     console.log(errorInfo);
+                    if (currentLogRef) {
+                        await updateQualiaOperationLog(currentLogRef, { error: errorInfo });
+                    }
                     continue;
+                }
+                // Other errors
+                if (currentLogRef) {
+                    await updateQualiaOperationLog(currentLogRef, { error: `Unknown error: ${e}` });
                 }
                 throw e;
             }
+        }
+
+        // Record step
+        if (currentLogRef) {
+            executedSteps.push({ logRef: currentLogRef });
         }
 
         // Mark integrated communications as acked
@@ -170,6 +209,12 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
     const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), { ...qualiaDoc, nextQualiaDocId: "", createdTime: Timestamp.now() });
     console.log(`New qualia doc created: ${newQualiaDocRef.id}`);
     await updateDoc(qualiaDocRef, { nextQualiaDocId: newQualiaDocRef.id, processingBefore: null });
+
+    // Update all executed steps with the new qualiaDocId
+    for (const step of executedSteps) {
+        await updateQualiaOperationLog(step.logRef, { qualiaDocId: newQualiaDocRef.id });
+    }
+
     return newQualiaDocRef;
 }
 
@@ -451,6 +496,38 @@ async function markCommunicationsAsAcked(communications: Communication[]) {
     }
 }
 
+async function logQualiaOperation(qualiaId: string, operations: IntegrationOperation[], communicationIds: string[], qualiaDocId?: string, error?: string, reasoning?: string): Promise<DocumentReference> {
+    return await addDoc(await qualiaDocOperationsCollection(), {
+        qualiaId,
+        qualiaDocId: qualiaDocId || "",
+        operations,
+        communicationIds,
+        error: error || "",
+        reasoning: reasoning || "",
+        createdTime: Timestamp.now()
+    });
+}
+
+async function updateQualiaOperationLog(logRef: DocumentReference, updates: { qualiaDocId?: string, error?: string }) {
+    await updateDoc(logRef, updates);
+}
+
+async function validateSizeReduction(oldDoc: QualiaDoc, newDoc: QualiaDoc, currentLogRef: DocumentReference) {
+    const oldNodeCount = Object.keys(oldDoc.nodes || {}).length;
+    const newNodeCount = Object.keys(newDoc.nodes || {}).length;
+
+    // Only check if we have a meaningful amount of nodes to start with (e.g., > 10)
+    if (oldNodeCount > 10 && newNodeCount < oldNodeCount * 0.5) {
+        const errorMessage = `CRITICAL: Operation aborted. Significant size reduction detected (Old: ${oldNodeCount}, New: ${newNodeCount}). Operation Log ID: ${currentLogRef.id}`;
+        console.error(errorMessage);
+
+        // Update log with error
+        await updateQualiaOperationLog(currentLogRef, { error: errorMessage });
+
+        throw new Error(errorMessage);
+    }
+}
+
 async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: string) {
     console.log("Attemping integration");
     async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: string) {
@@ -480,11 +557,27 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
 
                     // Retry loop (only for operation errors, not base graph corruption)
                     let lastOperations: IntegrationOperation[] | undefined;
+                    let currentLogRef: DocumentReference | undefined;
+
                     while (true) {
                         try {
                             const integrationResult = await integrateCommunications(qualiaDoc, pendingCommunications, errorInfo);
                             lastOperations = integrationResult.operations;
+
+                            // Log operations immediately
+                            currentLogRef = await logQualiaOperation(
+                                qualiaId,
+                                lastOperations,
+                                pendingCommunications.map(c => c.id).filter((id): id is string => !!id),
+                                undefined, // qualiaDocId: New doc not created yet, will be updated later
+                                undefined, // error: No error yet
+                                integrationResult.reasoning
+                            );
+
                             newDoc = applyOperations(qualiaDoc, integrationResult.operations);
+
+                            // Safety Check: Prevent significant size reduction (> 50%)
+                            await validateSizeReduction(qualiaDoc, newDoc, currentLogRef);
 
                             const cycles = detectCycles(newDoc);
                             if (cycles) {
@@ -493,6 +586,10 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
                                     errorInfo += `\nAttempted operations: ${JSON.stringify(lastOperations)}`;
                                 }
                                 console.log(errorInfo);
+
+                                // Update log with error
+                                await updateQualiaOperationLog(currentLogRef, { error: errorInfo });
+
                                 continue;
                             }
 
@@ -502,13 +599,28 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
                             // Base graph corruption - fail permanently, don't retry
                             if (e instanceof BaseGraphCorruptionError) {
                                 console.error("Base graph corruption detected:", e.message);
+                                if (currentLogRef) {
+                                    await updateQualiaOperationLog(currentLogRef, { error: `Base graph corruption: ${e.message}` });
+                                }
                                 throw e; // Propagate to caller/UI
                             }
                             // Operation validation errors - retry with context
                             if (e instanceof GraphValidationError) {
                                 errorInfo = e.message;
                                 console.log(errorInfo);
+                                if (currentLogRef) {
+                                    await updateQualiaOperationLog(currentLogRef, { error: errorInfo });
+                                }
                                 continue;
+                            }
+                            // Other errors
+                            if (currentLogRef) {
+                                // Avoid re-logging errors that were already handled and logged by validateSizeReduction
+                                if (e instanceof Error && e.message.startsWith("CRITICAL")) {
+                                    // Already logged
+                                } else {
+                                    await updateQualiaOperationLog(currentLogRef, { error: `Unknown error: ${e}` });
+                                }
                             }
                             throw e;
                         }
@@ -532,14 +644,10 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
 
                     console.log(`Created new qualia doc: ${newQualiaDocRef.id} from integration`);
 
-                    // Store operations record
-                    await addDoc(await qualiaDocOperationsCollection(), {
-                        qualiaId: qualiaId,
-                        qualiaDocId: newQualiaDocRef.id,
-                        operations: lastOperations!,
-                        communicationIds: pendingCommunications.map(c => c.id).filter((id): id is string => !!id),
-                        createdTime: Timestamp.now()
-                    });
+                    // Update the successful log with the new qualiaDocId
+                    if (currentLogRef) {
+                        await updateQualiaOperationLog(currentLogRef, { qualiaDocId: newQualiaDocRef.id });
+                    }
 
                     // Mark communications as acked
                     await markCommunicationsAsAcked(pendingCommunications);

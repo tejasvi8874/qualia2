@@ -35,7 +35,7 @@ yarn-error.*
 
 # typescript
 *.tsbuildinfo
-docs-devsite
+firebase-docs-devsite
 firebase_ai_implementation
 expo_docs
 !expo_docs/pages

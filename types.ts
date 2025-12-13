@@ -174,6 +174,8 @@ export interface QualiaDocOperationRecord {
   operations: IntegrationOperation[];
   communicationIds: string[];
   createdTime: Timestamp;
+  error?: string;
+  reasoning?: string;
 }
 
 export interface Qualia {
