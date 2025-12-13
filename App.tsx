@@ -19,13 +19,19 @@ import {
 } from "react-native";
 // Import SafeAreaProvider to use in the root and within the Modal
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
-import { sendMessage, registerClientMessageClb } from "./firebaseClientUtils";
+import { sendMessage, registerClientMessageClb, getContacts, updateContacts } from "./firebaseClientUtils";
 import { Communications, Communication, ContextQualia } from "./types";
-import { serverTimestamp, Timestamp } from "firebase/firestore";
+import { Timestamp } from "firebase/firestore";
 import { getUserId } from "./firebase";
 import { messageListener } from "./server";
 import { auth } from "./firebaseAuth";
-import { signInAnonymously } from "firebase/auth";
+import { signInAnonymously, linkWithPhoneNumber, RecaptchaVerifier, signInWithPhoneNumber } from "firebase/auth";
+
+declare global {
+  interface Window {
+    recaptchaVerifier: RecaptchaVerifier;
+  }
+}
 
 /*
 TODO: optimize get contacts to fetch conversation after the last contact timestamp
@@ -39,6 +45,17 @@ TODO: Trigger contact sharing when mentioned? Language etc issue. Maybe display 
 TODO: Suggestion to be cognizant of rate and last timstamp of human responses to detect if your messages are being viewed by a human.
 TODO: Clicking an ID triggers a message to that qualia by own qualia using best deducible name
 TODO: Encryption? With warning of data loss if key is lost.
+TODO: Qualia to gently ask phone number when suitable and send to SYSTEM for verification with OTP. Also after sharing contacts, qualia can contact relevant characters in the chats with the human counterpart.
+But you still need a way to login. That you could do in same way in natural language with Qualia but that might feel impersonal.
+Maybe a lightweight LLM to login/signup and then hand off to main qualia system.
+TODO: security auth rules
+TODO: Handle multiple clients listening and generating response
+Temporarily store the messages somewhere.
+TODO: Add older conversations to qualia
+TODO: Refactor out the communication recieving part from the communication processing and generation part
+TODO: Problem is can't tell where did I stop reading since the last message. Need some kind of visual break to indicate my typing starts?
+Maybe subtle three dot icon which can expand to the sent text?
+Fade timeout to force the user to listen more? Force them to be as close as human-human communication?
 */
 
 const IDLE_TIMEOUT = 1500; // 1.5 seconds of inactivity to send remaining input and clear
@@ -96,16 +113,7 @@ const getTheme = (colorScheme: LocalColorScheme): Theme => {
   };
 };
 
-// Mock Data
-const ONBOARDING_QUALIA = {
-  id: "q-onboarding",
-  name: "Onboarding",
-};
-const INITIAL_CONTACTS = [
-  { id: "q-friend-1", name: "Morgan" },
-  { id: "q-base", name: "Base Qualia" },
-  ONBOARDING_QUALIA, // Keep Onboarding available
-];
+
 
 // --- Components ---
 
@@ -186,6 +194,7 @@ interface QualiaSwitcherProps {
     action: { type: "SWITCH"; qualia: ContextQualia } | { type: "CREATE"; name: string },
   ) => void;
   theme: Theme;
+  onSignOut: () => void;
 }
 
 const QualiaSwitcher = ({
@@ -195,6 +204,7 @@ const QualiaSwitcher = ({
   userQualia,
   onAction,
   theme,
+  onSignOut,
 }: QualiaSwitcherProps) => {
   const [searchQuery, setSearchQuery] = useState("");
   const inputRef = useRef<TextInput>(null);
@@ -208,6 +218,12 @@ const QualiaSwitcher = ({
 
   const filteredContacts = useMemo(() => {
     return contacts
+      .slice()
+      .sort((a, b) => {
+        const timeA = a.lastContactTime?.toMillis() || 0;
+        const timeB = b.lastContactTime?.toMillis() || 0;
+        return timeB - timeA;
+      })
       .filter((contact) =>
         contact.name.toLowerCase().includes(searchQuery.toLowerCase()),
       );
@@ -280,33 +296,29 @@ const QualiaSwitcher = ({
             </TouchableOpacity>
           </View>
 
-          {userQualia && (
-            <TouchableOpacity
-              onPress={() => handleSelect(userQualia)}
-              style={styles.switchItem}
-            >
-              <Text style={[styles.switchItemText, { color: theme.accent }]}>
-                {userQualia.name} (Self)
-              </Text>
-            </TouchableOpacity>
-          )}
-
-          <FlatList
-            data={filteredContacts}
-            keyExtractor={(item) => item.id}
-            keyboardShouldPersistTaps="always"
-            scrollEventThrottle={16}
-            renderItem={({ item }) => (
-              <TouchableOpacity
-                onPress={() => handleSelect(item)}
-                style={styles.switchItem}
-              >
-                <Text style={[styles.switchItemText, { color: theme.text }]}>
-                  {item.name}
-                </Text>
-              </TouchableOpacity>
-            )}
-          />
+          <View style={{ flex: 1 }}>
+            <FlatList
+              data={filteredContacts}
+              keyExtractor={(item) => item.id}
+              keyboardShouldPersistTaps="always"
+              scrollEventThrottle={16}
+              renderItem={({ item }) => (
+                <TouchableOpacity
+                  onPress={() => handleSelect(item)}
+                  style={styles.switchItem}
+                >
+                  <Text style={[styles.switchItemText, { color: theme.text }]}>
+                    {item.name + (item.id === userQualia?.id ? " (Self)" : "")}
+                  </Text>
+                </TouchableOpacity>
+              )}
+            />
+          </View>
+          <TouchableOpacity onPress={onSignOut} style={styles.signOutButton}>
+            <Text style={[styles.switcherButtonText, { color: theme.dimText }]}>
+              Logout
+            </Text>
+          </TouchableOpacity>
         </SafeAreaView>
       </SafeAreaProvider>
     </Modal>
@@ -320,20 +332,64 @@ const AppContent = () => {
   const theme = useMemo(() => getTheme(colorScheme), [colorScheme]);
 
   useEffect(() => {
-    signInAnonymously(auth).then((x) => console.log("signed", x));
+    // For web, inject CSS to hide the reCAPTCHA badge.
+    if (Platform.OS === "web") {
+      const style = document.createElement("style");
+      style.textContent = ".grecaptcha-badge { visibility: hidden !important; }";
+      document.head.append(style);
+    }
   }, []);
 
   // State
   const [userQualia, setUserQualia] = useState<ContextQualia | null>(null);
-  // user id and user name
-  const [userName, setUserName] = useState<string| null>(null);
   const [userId, setUserId] = useState<string | null>(null);
 
   useEffect(() => {
-    getUserId().then(setUserId);
+    const unsubscribe = auth.onAuthStateChanged((user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        setUserId(null);
+        // Reset state on sign out
+        setUserQualia(null);
+        setActiveQualia(null);
+        setMessages([]);
+        setContacts([]);
+      }
+    });
+    return () => unsubscribe();
   }, []);
-  const [contacts, setContacts] = useState(INITIAL_CONTACTS);
-  const [activeQualia, setActiveQualia] = useState(ONBOARDING_QUALIA);
+
+  const [contacts, setContacts] = useState<ContextQualia[]>([]);
+  const [activeQualia, setActiveQualia] = useState<ContextQualia | null>(null);
+
+
+  useEffect(() => {
+    if (userId) {
+      getContacts().then(serverContacts => {
+        const contactMap = new Map<string, ContextQualia>();
+        serverContacts.forEach(contact => contactMap.set(contact.qualiaId, { id: contact.qualiaId, name: contact.names[0], lastContactTime: contact.lastContactTime }));
+
+        const serverContactsList = Array.from(contactMap.values());
+        setContacts(serverContactsList);
+
+        const self = serverContactsList.find(c => c.id === userId);
+        if (self) {
+          setUserQualia(self);
+          setActiveQualia(self);
+        } else {
+          // New user flow
+          const name = window.prompt("Welcome! Please enter your name:");
+          if (name) {
+            const newUserQualia = { id: userId, name: name, lastContactTime: Timestamp.now() };
+            setUserQualia(newUserQualia);
+            setActiveQualia(newUserQualia);
+            updateContacts([{ qualiaId: userId, names: [name], lastContactTime: Timestamp.now() }]);
+          }
+        }
+      });
+    }
+  }, [userId]);
 
 
   const [isThinkingMode, setIsThinkingMode] = useState(false); // False = Speaking
@@ -342,9 +398,14 @@ const AppContent = () => {
   const [inputText, setInputText] = useState("");
   const [isSwitcherVisible, setIsSwitcherVisible] = useState(false);
 
+  const handleSignOut = useCallback(() => {
+    auth.signOut();
+    setIsSwitcherVisible(false);
+  }, []);
+
   // Derived State for UI presentation
   const isTalkingToSelf = useMemo(() => {
-    return userQualia ? activeQualia.id === userQualia.id : false;
+    return userQualia && activeQualia ? activeQualia.id === userQualia.id : false;
   }, [userQualia, activeQualia]);
 
   // Refs
@@ -367,7 +428,9 @@ const AppContent = () => {
   // --- Message Management ---
   // Adds a message to the history, ensuring the context (activeQualia at the time) is stored.
   const addMessage = useCallback(
-    (text: string, isThought: boolean) => {
+    (text: string, fromQualiaId: string) => {
+      if (!activeQualia) return;
+      const isThought = fromQualiaId !== activeQualia.id;
       const newMessage: Message = {
         id: Date.now().toString() + Math.random(),
         text,
@@ -408,112 +471,42 @@ const AppContent = () => {
     return items;
   }, [messages]);
 
-  // --- Initialization & Onboarding ---
-
-  useEffect(() => {
-    // Start the onboarding flow
-    if (
-      !userQualia &&
-      activeQualia.id === ONBOARDING_QUALIA.id &&
-      messages.length === 0
-    ) {
-      setTimeout(() => {
-        addMessage("Welcome. I am the Onboarding Qualia.", false);
-      }, 500);
-      setTimeout(() => {
-        // Inform the user that the switcher is disabled
-        addMessage(
-          "(Your input is transmitted automatically. You cannot switch context until your identity is established. Once established, you can toggle between Speaking and Thinking when talking to others.)",
-          true,
-        );
-      }, 1500);
-      setTimeout(() => {
-        addMessage(
-          "To establish your presence, please tell me your name.",
-          false,
-        );
-      }, 3500);
-    }
-  }, [userQualia, activeQualia, messages.length, addMessage]);
-
-  // --- Core Logic (Simulated Backend) ---
+  // --- Core Logic ---
   useEffect(() => {
     if (!userId) {
       return;
     }
+    console.log("Setting up display message listener");
     const unsubscribePromise = registerClientMessageClb(
       (communication: Communication) =>
         Promise.resolve().then(() => {
+          if (!activeQualia) return;
           let message = communication.message;
+          console.log("Got message: ", JSON.stringify(communication).substring(0, 100));
           const isThought = communication.fromQualiaId !== activeQualia.id;
           if (isThought) {
             message = `[${communication.fromQualiaName}]: ${communication.message}`;
           }
-          addMessage(message, isThought);
+          addMessage(message, communication.fromQualiaId);
         }),
     );
     return () => {
-      unsubscribePromise.then((unsub) => unsub());
+      unsubscribePromise.then((unsub) => unsub()).then(() => {
+        console.log("Unsubscribed display message listener");
+      });
     };
-  }, [userId]);
+  }, [userId, activeQualia, addMessage]);
 
   const processInput = useCallback(
     async (input: string, contextQualia: ContextQualia, isThinkingInput: boolean) => {
-      if (!input || input.trim().length === 0) return;
-
-      // 1. Handle Onboarding Flow Initiation
-      if (contextQualia.id === ONBOARDING_QUALIA.id && !userQualia) {
-        // First time setup (providing the name)
-        const name = input.trim();
-        if (name.length > 1) {
-          const newUserQualia: ContextQualia = {
-            id: await getUserId(),
-            name: name,
-          };
-          setUserQualia(newUserQualia);
-
-          // (Context remains ONBOARDING_QUALIA)
-
-          setTimeout(() => {
-            // Onboarding confirms
-            addMessage(`Identity recognized. Welcome, ${name}.`, false);
-          }, 500);
-
-          setTimeout(() => {
-            // Requirement: let own qualia participate in conversation like any other qualia.
-            // User Qualia starts participating (its first thought)
-            // We use newUserQualia here as the source because userQualia state update is async.
-            addMessage(
-              `(Consciousness established. I am ${name}. I am observing this interaction.)`,
-              true,
-            );
-          }, 1000);
-
-          setTimeout(() => {
-            // Onboarding gives next steps
-            addMessage(
-              "You can now switch contexts by clicking my name at the top, or continue speaking to me.",
-              false,
-            );
-          }, 2500);
-        }
-        return;
-      }
-
-      // 2. Standard Processing
-      if (!userQualia) return; // Safety check (e.g. if user typed before onboarding finished initializing)
+      if (!input || input.trim().length === 0 || !userQualia) return;
 
       const isSelfContext = contextQualia.id === userQualia.id;
 
       // Requirement: Talking to own qualia: speaking/thinking is the same
       if (isSelfContext) {
         // Process the input internally by userQualia, regardless of mode.
-        setTimeout(() => {
-          const reflection = `Processed input: "${input.substring(0, 20)}..."`;
-          // Semantically, this is an internal process (thought), but UI will display it normally.
-          sendMessage({ toQualia: contextQualia, message: input, contextQualia, });
-          addMessage(reflection, true);
-        }, 300);
+        sendMessage({ toQualia: contextQualia, message: input, contextQualia, });
         return;
       }
 
@@ -522,40 +515,11 @@ const AppContent = () => {
       // If the input is a thought (Thinking about the external qualia)
       // Requirement: The user qualia then adds more details through thought communication
       if (isThinkingInput) {
-        setTimeout(() => {
-          // This will be shown stylized as a thought.
-          // Tailor the feedback slightly if it's a definition of a new qualia (using the 'q-new-' prefix)
-          const thoughtContext = contextQualia.id.startsWith("q-new-")
-            ? `Defining ${contextQualia.name}`
-            : `Thought recorded regarding ${contextQualia.name}`;
-
-          sendMessage({ toQualia: userQualia, message: input, contextQualia })
-          addMessage(
-            `(${thoughtContext}. Input: "${input.substring(0, 20)}...")`,
-            true,
-          );
-        }, 300);
+        sendMessage({ toQualia: userQualia, message: input, contextQualia })
         return; // Thoughts do not trigger external responses
       }
 
       // If the input is spoken (Speaking to the external qualia)
-
-      // User's qualia internal reflection on the communication
-      const reflection = `(Transmitting to ${contextQualia.name}: "${input.substring(0, 10)}...".)`;
-
-      if (Math.random() > 0.4) {
-        setTimeout(() => {
-          // This will be shown stylized as a thought.
-          addMessage(reflection, true);
-        }, 200);
-      }
-
-      // 3. Communication routing (Speaking)
-      setTimeout(() => {
-        const response = `Acknowledged, ${userQualia.name}. I noted: "${input}".`;
-        // This will be shown normally.
-        addMessage(response, false);
-      }, 1200);
       sendMessage({ toQualia: contextQualia, message: input, contextQualia });
     },
     [userQualia, addMessage],
@@ -565,7 +529,7 @@ const AppContent = () => {
 
   const sendChunk = useCallback(
     (chunk: string, thinking: boolean) => {
-      if (chunk.trim().length > 0) {
+      if (chunk.trim().length > 0 && activeQualia) {
         processInput(chunk.trim(), activeQualia, thinking);
       }
     },
@@ -604,22 +568,25 @@ const AppContent = () => {
       clearTimeout(timerRef.current);
     }
 
-    let newIndex = lastSentIndexRef.current;
     // Send chunk if punctuation is detected
     const punctuationMarks = [".", "!", "?", ";", ","];
     if (text && punctuationMarks.includes(text.charAt(text.length - 1))) {
       const chunk = text.substring(lastSentIndexRef.current);
       sendChunk(chunk, isThinkingMode);
-      newIndex = text.length;
-      lastSentIndexRef.current = newIndex;
+      lastSentIndexRef.current = text.length;
     }
 
-    if (text.length > newIndex) {
-      // Capture the current mode for the timeout function to ensure robustness
+    // If there is any text in the input, set a timer to finalize it after a delay.
+    // This ensures that even after sending a chunk on punctuation, the input will
+    // eventually be cleared.
+    if (text.length > 0) {
       const currentMode = isThinkingMode;
       timerRef.current = setTimeout(() => {
         finalizeInput(currentMode);
       }, IDLE_TIMEOUT);
+    } else {
+      // If the input is empty (e.g., user deleted everything), reset the index.
+      lastSentIndexRef.current = 0;
     }
   };
 
@@ -650,6 +617,7 @@ const AppContent = () => {
       const newQualia: ContextQualia = {
         id: `q-new-${Date.now()}`, // Prefix helps identify newly created qualia in processInput
         name: name,
+        lastContactTime: Timestamp.now(),
       };
 
       // 3. Add to contacts
@@ -665,7 +633,7 @@ const AppContent = () => {
       setTimeout(() => {
         addMessage(
           `(Entity "${name}" created. You are now in Thinking mode. Define its characteristics or switch to Speaking mode.)`,
-          true, // It is a thought by the userQualia
+          "ui", // It is a thought by the userQualia
         );
       }, 100);
 
@@ -695,11 +663,6 @@ const AppContent = () => {
       } else if (action.type === "SWITCH") {
         const newQualia = action.qualia;
         if (!newQualia) return;
-
-        // Safety check (Onboarding)
-        if (!userQualia && newQualia.id !== ONBOARDING_QUALIA.id) {
-          return;
-        }
 
         // Standard switch logic
         finalizeInput(isThinkingMode);
@@ -747,7 +710,7 @@ const AppContent = () => {
                 { color: userQualia ? theme.text : theme.dimText },
               ]}
             >
-              {activeQualia.name}
+              {activeQualia ? activeQualia.name : "Loading..."}
             </Text>
           </TouchableOpacity>
         </View>
@@ -811,7 +774,9 @@ const AppContent = () => {
         userQualia={userQualia}
         onAction={handleSwitcherAction}
         theme={theme}
+        onSignOut={handleSignOut}
       />
+      <View nativeID="sign-in-button" />
     </SafeAreaView>
   );
 };
@@ -930,6 +895,11 @@ const styles = StyleSheet.create({
   switchItemText: {
     fontFamily: FONT_FAMILY,
     fontSize: FONT_SIZE,
+  },
+  signOutButton: {
+    paddingVertical: 15,
+    paddingHorizontal: 20,
+    alignItems: "center",
   },
 });
 
