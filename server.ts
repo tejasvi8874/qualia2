@@ -76,14 +76,21 @@ async function getResponseCommunications(qualiaDoc: QualiaDoc, qualia: Qualia, c
 
 async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunications: Communication[], errorInfo?: string): Promise<IntegrationResponse> {
     const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
-    let prompt = `Integrate pending communications into the qualia by performing a series of operations on the graph:\n${JSON.stringify({ qualia: serializedQualia })}`;
+    const currentSize = JSON.stringify(serializedQualia).length;
+    const maxQualiaSizePercent = Math.round((currentSize / MAX_QUALIA_SIZE) * 10000) / 100;
+    console.log({ maxQualiaSizePercent })
+    let prompt = `Integrate pending communications into the qualia by performing a series of operations on the graph:\n${JSON.stringify({ qualia: serializedQualia, maxQualiaSizePercent })}`;
     if (errorInfo) {
-        prompt += `\n\nPrevious integration attempt failed: ${errorInfo}. Please resolve.`;
+        prompt += `\n\nPrevious integration attempt failed:\n\n${errorInfo}\n\nPlease resolve.`;
     }
     console.log(`Calling Gemini for integration with prompt length: ${prompt.length}`);
     console.log("Awaiting integration rate limiter...");
     await integrationRateLimiter.acquire();
     const result = await integrationModel.generateContent(prompt);
+
+    console.log({ qualiaDocTokensInt: await summarizerModel.countTokens(Object.values(serializedQualia.qualia).map(x => x.conclusion).join("\n")) })
+    console.log({ qualiaDocTokens: await integrationModel.countTokens(JSON.stringify(qualiaDoc)) })
+    console.log({ usageMetadata: result.response.usageMetadata });
     return JSON.parse(result.response.text());
 }
 
@@ -91,6 +98,7 @@ async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunicatio
 const MAX_COMPACTION_PROCESSING_SECONDS = 1200;
 const NETWORK_DELAY_SECONDS = 2;
 const COMPACTION_PROCESSING_SECONDS = 600;
+const MAX_QUALIA_SIZE = 2 ** 20;
 
 
 
@@ -108,10 +116,10 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
     }
 
     // Compaction loop
-    let serializedSize = serializeQualia(qualiaDoc).length; // Initial check without pending? Or should we include?
+    let serializedSize = JSON.stringify(serializeQualia(qualiaDoc)).length; // Initial check without pending? Or should we include?
     // Size check should probably include pending to be accurate about "total state size"
     const pendingCommunications = await getPendingCommunications(qualiaDoc.qualiaId);
-    serializedSize = serializeQualia(qualiaDoc, pendingCommunications).length;
+    serializedSize = JSON.stringify(serializeQualia(qualiaDoc, pendingCommunications)).length;
 
     const THRESHOLD = 10000; // Example threshold
 
@@ -206,7 +214,7 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
         // Mark integrated communications as acked
         await markCommunicationsAsAcked(currentPending);
 
-        serializedSize = serializeQualia(qualiaDoc, []).length; // Check size of graph only? Or fetch pending again?
+        serializedSize = JSON.stringify(serializeQualia(qualiaDoc, [])).length; // Check size of graph only? Or fetch pending again?
         // If we just acked them, they won't be pending anymore.
     }
 
@@ -706,8 +714,8 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
 export async function getQualiaDocRef(qualiaId: string) {
     let qualiaDocRef = await getQualiaDoc(qualiaId);
     const qualiaDoc = (await getDoc(qualiaDocRef)).data() as QualiaDoc;
-    const qualiaDocString = serializeQualia(qualiaDoc);
-    if (qualiaDocString.length > 2 ** 20) {
+    const qualiaDocString = JSON.stringify(serializeQualia(qualiaDoc));
+    if (qualiaDocString.length > MAX_QUALIA_SIZE) {
         qualiaDocRef = await qualiaCompaction(qualiaDocRef);
     }
     return qualiaDocRef;
@@ -804,21 +812,14 @@ async function getQualiaDoc(qualiaId: string): Promise<DocumentReference> {
 }
 
 
-export async function summarizeQualiaDoc(qualiaDoc: QualiaDoc): Promise<string> {
-    const serialized = serializeQualia(qualiaDoc);
-    const prompt = `Organize the following Qualia into a narrative that captures the core beliefs, memories, and current state. Do not leave out ANY details. Also highlight what is most relevant for an audio conversation:\n${serialized}`;
-    console.log("Awaiting summarizer rate limiter...");
-    await summarizerRateLimiter.acquire();
-    const result = await summarizerModel.generateContent(prompt);
-    const response = JSON.parse(result.response.text());
-    return response.summary;
+export function summarizeQualiaDoc(qualiaDoc: QualiaDoc): string {
+    return Object.values(serializeQualia(qualiaDoc).qualia).map(x => x.conclusion).join("\n");
 }
 
-export async function summarizeConversations(conversations: Communication[], qualiaDoc: QualiaDoc): Promise<string> {
+export async function summarizeConversations(conversations: Communication[], qualiaDocSummary: string): Promise<string> {
     if (conversations.length === 0) return "";
     const serializedConversations = JSON.stringify(conversations);
-    const serializedQualia = serializeQualia(qualiaDoc);
-    const prompt = `Organize the following recent conversations. Do not leave out ANY details. Highlight the key topics discussed and the user's sentiment. Use the provided Qualia for context:\n\nQualia:\n${serializedQualia}\n\nConversations:\n${serializedConversations}`;
+    const prompt = `Organize the following recent conversations in extreme detail. Highlight the key topics discussed and the user's sentiment. Use the provided Qualia for context:\n\nQualia:\n${qualiaDocSummary}\n\nConversations:\n${serializedConversations}`;
     console.log("Awaiting summarizer rate limiter...");
     await summarizerRateLimiter.acquire();
     const result = await summarizerModel.generateContent(prompt);
@@ -826,11 +827,10 @@ export async function summarizeConversations(conversations: Communication[], qua
     return response.summary;
 }
 
-export async function summarizeOperations(operations: IntegrationOperation[], qualiaDoc: QualiaDoc): Promise<string> {
+export async function summarizeOperations(operations: IntegrationOperation[], qualiaDocSummary: string): Promise<string> {
     if (operations.length === 0) return "";
     const serializedOperations = JSON.stringify(operations);
-    const serializedQualia = serializeQualia(qualiaDoc);
-    const prompt = `Organize the following changes to the knowledge graph as highly detailed subconscious thoughts and realizations. Do not leave out ANY details. It should sound like an internal monologue. Use the provided Qualia for context:\n\nQualia:\n${serializedQualia}\n\nChanges:\n${serializedOperations}`;
+    const prompt = `Organize the following changes to the knowledge graph as extremely detailed subconscious thoughts and realizations. Do not leave out ANY details. It should sound like an internal monologue. Use the provided Qualia for context:\n\nQualia:\n${qualiaDocSummary}\n\nChanges:\n${serializedOperations}`;
     console.log("Awaiting summarizer rate limiter...");
     await summarizerRateLimiter.acquire();
     const result = await summarizerModel.generateContent(prompt);

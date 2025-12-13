@@ -116,7 +116,19 @@ async function claimAndProcess(ref: DocumentReference<DocumentData, DocumentData
     );
 
     if (result === undefined) {
-      return await processData(data, ref, callback, processedField);
+      // Fetch the latest document state to decide whether to retry, wait, or stop
+      const doc = await getDoc(ref);
+      if (doc.exists()) {
+        const newData = { ...doc.data(), id: doc.id } as Communication;
+        // If already processed, stop immediately
+        if ((newData as any)[processedField]) {
+          return;
+        }
+        // If not processed, retry with the fresh data (which might have processingBefore set)
+        return await processData(newData, ref, callback, processedField);
+      }
+      // Doc deleted, stop
+      return;
     }
   } catch (error) {
     console.error(`Error processing ${data}: ${error}`);
@@ -236,7 +248,7 @@ export async function runWithLock<T>(
       }
     });
   }
-  console.log(`Failed to acquire lock for ${docRef.id}`);
+  console.debug(`Failed to acquire lock for ${docRef.id}`)
   return undefined;
 }
 

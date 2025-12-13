@@ -1037,13 +1037,10 @@ const AppContent = () => {
           const qualiaDocSnap = await getDoc(qualiaDocRef);
           const qualiaDoc = qualiaDocSnap.data() as QualiaDoc;
           const pendingCommunications = await getPendingCommunications(activeQualia.id);
+          const qualiaDocSummary = summarizeQualiaDoc(qualiaDoc);
+          const convSummary = summarizeConversations(pendingCommunications, qualiaDocSummary);
 
-          const [docSummary, convSummary] = await Promise.all([
-            summarizeQualiaDoc(qualiaDoc),
-            summarizeConversations(pendingCommunications, qualiaDoc)
-          ]);
-
-          systemInstruction = `You are a qualia.\n\nNote: You may receive user messages indicating your subconscious thoughts. These are your own internal realizations and NOT dialogue from the user. These thoughts might or might not affect subsequent conversation with the user and do NOT directly reference these thoughts or any other subconscious thoughts in your response in any way unless intending to communicate them verbatim to the user. The user provided thoughts will end with (end subconscious thoughts).\n\nHere is your memory and context:\n${JSON.stringify({ myQualiaId: activeQualia.id, memorySummary: docSummary, recentConversationsSummary: convSummary, money: 100 })}`;
+          systemInstruction = `You are a qualia.\n\nNote: You may receive user messages indicating your subconscious thoughts. These are your own internal realizations and NOT dialogue from the user. These thoughts might or might not affect subsequent conversation with the user and do NOT directly reference these thoughts or ANY other subconscious thoughts in your response in any way. The user provided thoughts will end with (end subconscious thoughts).\n\nHere is your memory and context:\n${JSON.stringify({ myQualiaId: activeQualia.id, memorySummary: qualiaDocSummary, recentConversationsSummary: convSummary, money: 100 })}`;
           console.log("System instruction prepared with context:", systemInstruction);
         } catch (e) {
           console.error("Failed to fetch context for audio session:", e);
@@ -1097,7 +1094,7 @@ const AppContent = () => {
               const qualiaDocSnap = await getDoc(qualiaDocRef);
               const qualiaDoc = qualiaDocSnap.data() as QualiaDoc;
 
-              const summary = await summarizeOperations(allOperations, qualiaDoc);
+              const summary = await summarizeOperations(allOperations, summarizeQualiaDoc(qualiaDoc));
               if (summary) {
                 if (!isCallingRef.current) {
                   console.log("Call ended, skipping subconscious thought injection");

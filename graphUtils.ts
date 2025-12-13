@@ -64,7 +64,23 @@ function serializeCommunication(comm: Communication): Record<string, any> {
     return result;
 }
 
-export function serializeQualia(doc: QualiaDoc, pendingCommunications: Communication[] = []): string {
+export interface SerializedAssumption {
+    id: string;
+    assumption: string;
+}
+
+export interface SerializedNode {
+    id: string;
+    conclusion: string;
+    assumptions: SerializedAssumption[];
+}
+
+export interface SerializedQualia {
+    qualia: SerializedNode[];
+    recentCommunications: Record<string, any>[];
+}
+
+export function serializeQualia(doc: QualiaDoc, pendingCommunications: Communication[] = []): SerializedQualia {
     const nodes = doc.nodes || {};
     const pending = pendingCommunications.map(serializeCommunication);
 
@@ -152,7 +168,7 @@ export function serializeQualia(doc: QualiaDoc, pendingCommunications: Communica
         }
     }
 
-    return JSON.stringify({ "qualia": serializedNodes, "recentCommunications": pending });
+    return { "qualia": serializedNodes, "recentCommunications": pending };
 }
 
 export class BaseGraphCorruptionError extends Error {
@@ -259,7 +275,7 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
                 const ancestors = getAllAncestors(newDoc.nodes, node.id);
                 const idsToDelete = [node.id, ...ancestors];
                 errors.push(
-                    `Conclusion ${node.id} refers to missing assumption ${assumptionId}. You must also remove its parent conclusion ${node.id} and all its ancestor conclusions. Therefore all the IDs in [${idsToDelete.join(", ")}] have to be deleted and created anew if required.`
+                    `The deleted assumption ${assumptionId} has an undeleted parent conclusion ${node.id}. You must remove the parent conclusion ${node.id} and all its ancestor conclusions. Therefore all the IDs in [${idsToDelete.join(", ")}] have to be deleted and created anew if required.`
                 );
             }
         }
@@ -278,8 +294,9 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
     }
 
     // Throw all collected errors together
-    if (errors.length > 0) {
-        throw new GraphValidationError(errors.join('\n'), operations);
+    const uniqueErrors = Array.from(new Set(errors));
+    if (uniqueErrors.length > 0) {
+        throw new GraphValidationError(uniqueErrors.join('\n'), operations);
     }
 
     return newDoc;
