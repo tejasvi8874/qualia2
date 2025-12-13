@@ -5,9 +5,10 @@ import { Buffer } from 'buffer';
 
 // Parallel web implementation in audio.html
 
-export async function startAudioSession(onTranscriptPart: (type: 'user' | 'gemini', message: string) => void, onTranscriptFlush: (type: 'user' | 'gemini' | 'ended', message: string) => void): Promise<LiveSession> {
+export async function startAudioSession(onTranscriptPart: (type: 'user' | 'gemini', message: string) => void, onTranscriptFlush: (type: 'user' | 'gemini' | 'ended', message: string) => void, systemInstruction?: string): Promise<LiveSession> {
     const model = getLiveGenerativeModel(ai, {
         model: "gemini-live-2.5-flash-preview",
+        systemInstruction: systemInstruction,
         generationConfig: {
             inputAudioTranscription: {},
             outputAudioTranscription: {},
@@ -54,7 +55,7 @@ async function receiveMessages(liveSession: LiveSession, onTranscriptPart: (type
 
     try {
         for await (const message of messageStream) {
-            console.log(JSON.parse(JSON.stringify(message)));
+            // console.log(JSON.parse(JSON.stringify(message)));
             if (message.type === 'serverContent') {
                 if (message.inputTranscription?.text) {
                     flushModel();

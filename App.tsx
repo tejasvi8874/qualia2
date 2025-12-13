@@ -21,10 +21,12 @@ import {
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 import { sendMessage, registerClientMessageClb, getContacts, updateContacts, getHistoricalMessages } from "./firebaseClientUtils";
-import { Communication, ContextQualia } from "./types";
-import { Timestamp } from "firebase/firestore";
-import { messageListener, startIntegrationLoop } from "./server";
-import { auth } from "./firebaseAuth";
+import { Communication, ContextQualia, QualiaDoc } from "./types";
+import { Timestamp, getDoc, addDoc } from "firebase/firestore";
+import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef } from "./server";
+import { serializeQualia } from "./graphUtils";
+import { auth, db } from "./firebaseAuth";
+import { communicationsCollection } from "./firebase";
 import { RecaptchaVerifier } from "firebase/auth";
 import { firebaseConfig } from "./firebaseConfig";
 import { startAudioSession } from "./audioSession";
@@ -720,19 +722,35 @@ const AppContent = () => {
       addMessage("(Call started)", "ui");
       setIsCalling(true);
       if (Platform.OS === 'web') {
+        // Fetch context
+        let systemInstruction = undefined;
+        if (activeQualia) {
+          try {
+            const qualiaDocRef = await getQualiaDocRef(activeQualia.id);
+            const qualiaDocSnap = await getDoc(qualiaDocRef);
+            const qualiaDoc = qualiaDocSnap.data() as QualiaDoc;
+            const pendingCommunications = await getPendingCommunications(activeQualia.id);
+            const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
+            systemInstruction = `You are a qualia. Here is your memory and context:\n${JSON.stringify({ myQualiaId: activeQualia.id, qualia: serializedQualia, money: 100 })}`;
+            console.log("System instruction prepared with context.");
+          } catch (e) {
+            console.error("Failed to fetch context for audio session:", e);
+          }
+        }
+
         const session = await startAudioSession(
           (type, text) => { // onTranscriptPart
             const isContinuing = lastTranscriptType.current === type;
             if (!isContinuing) {
               currentStreamDeliveryTime.current = Timestamp.now();
             }
-            addMessage(text, type, {
+            addMessage(text, type === 'user' ? (userQualia?.id || 'user') : (activeQualia?.id || 'gemini'), {
               appendToLast: isContinuing,
               deliveryTime: currentStreamDeliveryTime.current || Timestamp.now()
             });
             lastTranscriptType.current = type;
           },
-          (type, text) => { // onTranscriptFlush
+          async (type, text) => { // onTranscriptFlush
             if (type === 'ended') {
               setIsCalling(false);
               setLiveSession(null);
@@ -742,9 +760,41 @@ const AppContent = () => {
             } else {
               lastTranscriptType.current = null;
               currentStreamDeliveryTime.current = null;
-              // In future, send `text` to qualia.
+
+              // Persist transcript
+              if (activeQualia && userQualia) {
+                const deliveryTime = Timestamp.now();
+                if (type === 'user') {
+                  const communication: Communication = {
+                    fromQualiaId: userQualia.id,
+                    fromQualiaName: userQualia.name,
+                    toQualiaId: activeQualia.id,
+                    toQualiaName: activeQualia.name,
+                    message: text,
+                    communicationType: "HUMAN_TO_QUALIA",
+                    ack: false,
+                    seen: true,
+                    deliveryTime: deliveryTime,
+                  };
+                  addDoc(await communicationsCollection(), communication);
+                } else if (type === 'gemini') {
+                  const communication: Communication = {
+                    fromQualiaId: activeQualia.id,
+                    fromQualiaName: activeQualia.name,
+                    toQualiaId: userQualia.id,
+                    toQualiaName: userQualia.name,
+                    message: text,
+                    communicationType: "QUALIA_TO_HUMAN",
+                    ack: false,
+                    seen: true,
+                    deliveryTime: deliveryTime
+                  };
+                  addDoc(await communicationsCollection(), communication);
+                }
+              }
             }
-          }
+          },
+          systemInstruction
         );
         setLiveSession(session);
       } else {
