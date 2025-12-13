@@ -10,7 +10,7 @@
   "dependencies": {
     "@expo/metro-runtime": "~6.1.2",
     "@expo/vector-icons": "^15.0.3",
-    "@firebase/ai": "file:../forks/firebase-js-sdk/packages/ai/firebase-ai-2.5.0.tgz",
+    "@firebase/ai": "file:../forks/firebase-js-sdk/packages/ai/firebase-ai-2.6.0.tgz",
     "@react-native-async-storage/async-storage": "2.2.0",
     "expo": "^54.0.21",
     "expo-audio": "~1.0.14",

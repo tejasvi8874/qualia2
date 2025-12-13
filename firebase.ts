@@ -41,14 +41,14 @@ export async function qualiaDocsCollection() {
   return collection(db, "qualiaDocs");
 }
 
-export function getMessageListener(userId: string, collectionRef: CollectionReference<DocumentData, DocumentData>, communicationTypeFilter: QueryFieldFilterConstraint, callback: (communication: Communication) => Promise<void>, singleListener: boolean) {
+export function getMessageListener(userId: string, collectionRef: CollectionReference<DocumentData, DocumentData>, communicationTypeFilter: QueryFieldFilterConstraint, callback: (communication: Communication) => Promise<void>, singleListener: boolean, processedField: string = "ack") {
   console.log(`Registering message listener for userId: ${userId} and communicationTypeFilter: ${JSON.stringify(communicationTypeFilter)}`);
   // Filters excludes docs where the field is not set.
   const q = query(
     collectionRef,
     where("toQualiaId", "==", userId),
     communicationTypeFilter,
-    where("ack", "==", false)
+    where(processedField, "==", false)
   );
 
   return onSnapshot(q, async (snapshot) => {
@@ -65,9 +65,9 @@ export function getMessageListener(userId: string, collectionRef: CollectionRefe
           console.log(`Handling message in generic listener: ${JSON.stringify(data)}`);
           new Promise(resolve => setTimeout(resolve, timeToWait)).then(() => {
             if (singleListener) {
-              processData(data, doc.ref, callback);
+              processData(data, doc.ref, callback, processedField);
             } else {
-              callback(data).then(() => updateDoc(doc.ref, { ack: true }));
+              callback(data).then(() => updateDoc(doc.ref, { [processedField]: true }));
             }
           });
         }
@@ -81,7 +81,7 @@ const NETWORK_DELAY_SECONDS = 2
 const PROCESSING_SECONDS = 60
 
 
-async function processData(data: Communication, ref: DocumentReference<DocumentData, DocumentData>, callback: (communication: Communication) => Promise<void>): Promise<void> {
+async function processData(data: Communication, ref: DocumentReference<DocumentData, DocumentData>, callback: (communication: Communication) => Promise<void>, processedField: string): Promise<void> {
   if (data.processingBefore) {
     const processingBefore = data.processingBefore.toMillis();
     const timeToWait = getTimeToWait(processingBefore);
@@ -89,15 +89,15 @@ async function processData(data: Communication, ref: DocumentReference<DocumentD
       // Deadline not hit yet, some other client is processing
       await new Promise(resolve => setTimeout(resolve, timeToWait));
       const doc = await getDoc(ref);
-      if (doc.exists() && !doc.data()!.ack) {
-        return await processData(data, ref, callback);
+      if (doc.exists() && !doc.data()![processedField]) {
+        return await processData(data, ref, callback, processedField);
       }
     };
   }
-  return await claimAndProcess(ref, callback, data);
+  return await claimAndProcess(ref, callback, data, processedField);
 }
 
-async function claimAndProcess(ref: DocumentReference<DocumentData, DocumentData>, callback: (communication: Communication) => Promise<void>, data: Communication): Promise<void> {
+async function claimAndProcess(ref: DocumentReference<DocumentData, DocumentData>, callback: (communication: Communication) => Promise<void>, data: Communication, processedField: string): Promise<void> {
   try {
     const claimed = await runTransaction(db, async (transaction) => {
       const doc = await transaction.get(ref);
@@ -105,7 +105,7 @@ async function claimAndProcess(ref: DocumentReference<DocumentData, DocumentData
         return false;
       }
       const data = doc.data() as Communication;
-      if (data.ack) {
+      if (data[processedField as keyof Communication]) {
         return false;
       }
       if (data.processingBefore && getTimeToWait(data.processingBefore.toMillis()) > 0) {
@@ -115,9 +115,9 @@ async function claimAndProcess(ref: DocumentReference<DocumentData, DocumentData
       return true;
     });
     if (claimed) {
-      return await callback(data).then(() => updateDoc(ref, { ack: true }));
+      return await callback(data).then(() => updateDoc(ref, { [processedField]: true }));
     } else {
-      return await processData(data, ref, callback);
+      return await processData(data, ref, callback, processedField);
     }
   } catch (error) {
     console.error(`Error processing ${data}: ${error}`);
