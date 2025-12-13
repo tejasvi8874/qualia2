@@ -10,6 +10,7 @@
     "predeploy": "expo export -p web",
     "deploy-hosting": "npm run predeploy && firebase deploy --only hosting",
     "preview-hosting": "npm run predeploy && firebase hosting:channel:deploy preview",
+    "deploy-everywhere": "npm run deploy:hosting && npm run deploy:web",
     "build:bundles": "npm run build:audio && npm run build:auth",
     "build:audio": "esbuild audio.ts --bundle --outfile=public/audio.bundle --format=iife --platform=browser --sourcemap",
     "build:auth": "esbuild auth.ts --bundle --outfile=public/auth.bundle --format=iife --platform=browser --sourcemap"

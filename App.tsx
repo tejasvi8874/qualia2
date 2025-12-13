@@ -457,6 +457,20 @@ const AppContent = () => {
   const [authHtml, setAuthHtml] = useState<string>("");
   const [isRecaptchaVisible, setIsRecaptchaVisible] = useState(false);
   const [isSendingCode, setIsSendingCode] = useState(false);
+  const [viewportHeight, setViewportHeight] = useState<number | string>(Platform.OS === 'web' ? '100%' : '100%');
+
+  // Inject global CSS for web to fix autocomplete background color and viewport meta
+  useEffect(() => {
+    if (Platform.OS === 'web') {
+      const meta = document.querySelector('meta[name="viewport"]');
+      if (meta) {
+        const content = meta.getAttribute('content') || '';
+        if (!content.includes('interactive-widget=resizes-content')) {
+          meta.setAttribute('content', `${content}, interactive-widget=resizes-content`);
+        }
+      }
+    }
+  }, []);
 
   const postToAuthWebView = useCallback((payload: object) => {
     const message = JSON.stringify(payload);
@@ -522,6 +536,8 @@ const AppContent = () => {
       }
 
       try {
+        setIsSendingCode(true);
+        setInputText("");
         const appVerifier = new RecaptchaVerifier(auth, 'sign-in-button', {
           'size': 'invisible',
           'callback': (response: any) => {
@@ -533,8 +549,8 @@ const AppContent = () => {
 
         const result = await signInWithPhoneNumber(auth, phoneNumber, appVerifier);
         setConfirmationResult(result);
+        setIsSendingCode(false);
         console.log("logged in")
-        setInputText("");
         setTimeout(() => inputRef.current?.focus(), 100);
       } catch (error: any) {
         console.error("Phone Auth Error:", error);
@@ -554,6 +570,16 @@ const AppContent = () => {
       }
     }
   }, [inputText, confirmationResult, verificationId, postToAuthWebView]);
+
+  // Auto-submit OTP when it becomes 6 digits
+  useEffect(() => {
+    if (!userId && (confirmationResult || verificationId)) {
+      // Only auto-submit if it's exactly 6 digits
+      if (/^\d{6}$/.test(inputText)) {
+        handleAuthSubmit();
+      }
+    }
+  }, [inputText, userId, confirmationResult, verificationId, handleAuthSubmit]);
 
   useEffect(() => {
     const unsubscribe = auth.onAuthStateChanged((user) => {
@@ -1331,6 +1357,12 @@ ${qualiaDocSummary}${convSummary ? "\n\nThe most recent conversation:\n\n" + con
 
   const modeText = isThinkingMode ? "Thinking" : "Speaking";
 
+  const Wrapper = Platform.OS === 'web' ? View : KeyboardAvoidingView;
+  const wrapperProps = Platform.OS === 'web' ? { style: styles.container } : {
+    behavior: Platform.OS === "ios" ? "padding" : "height",
+    style: styles.container
+  };
+
   return (
     // SafeAreaView ensures content is below the status bar/notch and clickable on all platforms
     <SafeAreaView
@@ -1441,13 +1473,7 @@ ${qualiaDocSummary}${convSummary ? "\n\nThe most recent conversation:\n\n" + con
             underlineColorAndroid="transparent"
             submitBehavior={userId ? "newline" : "submit"}
             blurOnSubmit={false}
-            keyboardType={
-              !userId
-                ? ((Platform.OS === "web"
-                  ? (!confirmationResult ? "phone-pad" : "number-pad")
-                  : (!verificationId ? "phone-pad" : "number-pad")))
-                : "default"
-            }
+            inputMode={userId ? "text" : (confirmationResult || verificationId) ? "numeric" : "tel"}
             textContentType={
               !userId
                 ? ((Platform.OS === "web"
@@ -1458,20 +1484,23 @@ ${qualiaDocSummary}${convSummary ? "\n\nThe most recent conversation:\n\n" + con
             autoComplete={
               !userId
                 ? ((Platform.OS === "web"
-                  ? (!confirmationResult ? "tel" : "sms-otp")
-                  : (!verificationId ? "tel" : "sms-otp")))
+                  ? (!confirmationResult ? "tel-national" : "one-time-code")
+                  : (!verificationId ? "tel" : "one-time-code")))
                 : undefined
             }
             returnKeyType={!userId ? "done" : "default"}
             onSubmitEditing={!userId ? handleAuthSubmit : undefined}
-            onBlur={() => {
-              if (!userId && Platform.OS === 'web' && confirmationResult) {
-                if (/^\d{6}$/.test(inputText)) {
-                  handleAuthSubmit();
-                }
-              }
-            }}
           />
+          {!userId && Platform.OS === 'web' && (
+            <TouchableOpacity
+              onPress={handleAuthSubmit}
+              style={[styles.modeToggle, { alignSelf: 'flex-start', paddingTop: 4 }]}
+            >
+              <Text style={[styles.modeToggleText, { color: theme.text, fontStyle: 'normal', fontSize: 20 }]}>
+                Send
+              </Text>
+            </TouchableOpacity>
+          )}
           {/* Requirement: Don't show thinking/speaking toggle when talking to own qualia. 
               Also hide until userQualia is established. */}
           {userQualia && !isTalkingToSelf && (
@@ -1500,7 +1529,7 @@ ${qualiaDocSummary}${convSummary ? "\n\nThe most recent conversation:\n\n" + con
         theme={theme}
         onSignOut={handleSignOut}
       />
-      <View nativeID="sign-in-button" />
+      <View nativeID="sign-in-button" style={Platform.OS === 'web' ? { position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', zIndex: -1 } : undefined} />
       {Platform.OS !== 'web' && !userQualia && !verificationId && authHtml && (
         <View
           style={{
