@@ -20,21 +20,7 @@ import { getGenerativeModel, HarmBlockThreshold, HarmCategory, ObjectSchema, Gen
 import { Communications, Communication, Contact, Contacts, QualiaDoc, Qualia, IntegrationResponse, IntegrationOperation, INTEGRATION_SCHEMA, COMMUNICATION_SCHEMA } from "./types";
 import { serializeQualia, applyOperations, detectCycles, GraphValidationError, BaseGraphCorruptionError } from "./graphUtils";
 
-async function generateContentNonStreaming(model: GenerativeModel, prompt: string) {
-    const result = await model.generateContentStream(prompt);
-    // Verify there is some content to stream
 
-    let text = "";
-    for await (const chunk of result.stream) {
-        try {
-            text += chunk.text();
-        } catch (error) {
-            console.error(error);
-            throw error;
-        }
-    }
-    return { response: { text: () => text } };
-}
 
 /*
 Runs in background, handles all communications. Designed to run on device or in cloud.
@@ -53,7 +39,7 @@ export async function messageListener() {
 
 const safetySettings = Object.values(HarmCategory).map((category) => ({ category, threshold: HarmBlockThreshold.BLOCK_NONE }));
 // pro, flash, flash-lite
-const proModel = (schema: ObjectSchema) => getGenerativeModel(ai, { model: "gemini-2.5-pro", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 32768 }, }, safetySettings }, { timeout: 1200 * 1e3 });
+const proModel = (schema: ObjectSchema) => getGenerativeModel(ai, { model: "gemini-3-pro-preview", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 32768 }, }, safetySettings }, { timeout: 1200 * 1e3 });
 const flashModel = (schema: ObjectSchema) => getGenerativeModel(ai, { model: "gemini-2.5-flash-preview-09-2025", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 24576 }, }, safetySettings }, { timeout: 1200 * 1e3 });
 const communicationModel = flashModel(COMMUNICATION_SCHEMA);
 const integrationModel = proModel(INTEGRATION_SCHEMA);
@@ -71,10 +57,20 @@ async function getResponseCommunications(qualiaDoc: QualiaDoc, qualia: Qualia, c
     const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
     const prompt = `Generate new commmunications if required, keeping previous conversations in mind:\n${JSON.stringify({ myQualiaId: qualia.qualiaId, qualia: serializedQualia, money: qualia.money, communication: communication })}`;
     console.log(`Calling Gemini with prompt: ${prompt.substring(0, 100)}...`);
-    const result = await generateContentNonStreaming(communicationModel, prompt);
-    const response = JSON.parse(result.response.text());
+    const result = await communicationModel.generateContent(prompt);
+    const response = parseResult(result);
     console.log(`Received response from Gemini: ${JSON.stringify(response)}`);
     return response;
+}
+
+function parseResult(result: { response: { text: () => string } }) {
+    const text = result.response.text();
+    try {
+        return JSON.parse(text);
+    } catch (error) {
+        console.error(`Error parsing integration response: ${text}`);
+        throw error;
+    }
 }
 
 async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunications: Communication[], errorInfo?: string): Promise<IntegrationResponse> {
@@ -84,8 +80,8 @@ async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunicatio
         prompt += `\n\nPrevious integration attempt failed: ${errorInfo}. Please resolve.`;
     }
     console.log(`Calling Gemini for integration with prompt length: ${prompt.length}`);
-    const result = await generateContentNonStreaming(integrationModel, prompt);
-    return JSON.parse(result.response.text());
+    const result = await integrationModel.generateContent(prompt);
+    return parseResult(result);
 }
 
 
@@ -135,8 +131,8 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
         while (true) {
             try {
                 const currentPrompt = errorInfo ? prompt + `\n\nPrevious attempt failed:\n\n${errorInfo}` : prompt;
-                const result = await generateContentNonStreaming(integrationModel, currentPrompt);
-                ops = JSON.parse(result.response.text()) as IntegrationResponse;
+                const result = await integrationModel.generateContent(currentPrompt);
+                ops = parseResult(result) as IntegrationResponse;
 
                 const newDoc = applyOperations(qualiaDoc, ops.operations);
 
@@ -183,7 +179,7 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
     // So we just update the CURRENT doc? Or create a new one?
     // Existing code creates a new doc. Let's stick to that pattern to be safe/immutable-ish.
 
-    const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), { ...qualiaDoc, nextQualiaDocId: "" });
+    const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), { ...qualiaDoc, nextQualiaDocId: "", createdTime: Timestamp.now() });
     console.log(`New qualia doc created: ${newQualiaDocRef.id}`);
     await updateDoc(qualiaDocRef, { nextQualiaDocId: newQualiaDocRef.id, processingBefore: null });
     return newQualiaDocRef;
@@ -427,7 +423,7 @@ function startPendingCommunicationsListener(qualiaId: string) {
 export async function startIntegrationLoop(qualiaId: string) {
     console.log(`Starting integration loop for qualiaId: ${qualiaId}`);
     startPendingCommunicationsListener(qualiaId);
-    while (true) {
+    while (false) {
         try {
             // Use the central trigger with debounce logic
             await triggerIntegration(qualiaId);
@@ -545,7 +541,8 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
         const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), {
             ...newDoc!,
             nextQualiaDocId: "",
-            processingBefore: null
+            processingBefore: null,
+            createdTime: Timestamp.now()
         });
 
         await updateDoc(qualiaDocRef, {
@@ -659,7 +656,7 @@ async function getQualiaDoc(qualiaId: string): Promise<DocumentReference> {
     const docs = snapshot.docs;
     if (docs.length === 0) {
         // Create initial qualia doc
-        const initialQualiaDoc: QualiaDoc = { qualiaId: qualiaId, nodes: {}, nextQualiaDocId: "", };
+        const initialQualiaDoc: QualiaDoc = { qualiaId: qualiaId, nodes: {}, nextQualiaDocId: "", createdTime: Timestamp.now() };
         return await addDoc(await qualiaDocsCollection(), initialQualiaDoc);
     }
     if (docs.length > 1) {

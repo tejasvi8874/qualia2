@@ -1,3 +1,5 @@
+import { polyfill as polyfillFetch } from 'react-native-polyfill-globals/src/fetch';
+polyfillFetch();
 import { registerRootComponent } from 'expo';
 
 import App from './App';

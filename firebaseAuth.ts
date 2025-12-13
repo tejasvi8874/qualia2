@@ -1,4 +1,6 @@
-import { getAuth, setPersistence, indexedDBLocalPersistence, browserLocalPersistence, signInWithPhoneNumber, RecaptchaVerifier, User, onAuthStateChanged } from "firebase/auth";
+import { getAuth, setPersistence, indexedDBLocalPersistence, browserLocalPersistence, signInWithPhoneNumber, RecaptchaVerifier, User, onAuthStateChanged, initializeAuth } from "firebase/auth";
+import { getReactNativePersistence } from 'firebase/auth';
+import ReactNativeAsyncStorage from '@react-native-async-storage/async-storage';
 import {
     getFirestore,
     persistentLocalCache,
@@ -26,6 +28,7 @@ initializeFirestore(app, {
         ? persistentLocalCache({ tabManager: persistentMultipleTabManager() })
         : persistentLocalCache()
 });
+initializeAuth(app, {persistence: Constants.platform?.web ? browserLocalPersistence : getReactNativePersistence(ReactNativeAsyncStorage) });
 export const auth = getAuth(app);
 auth.useDeviceLanguage();
 

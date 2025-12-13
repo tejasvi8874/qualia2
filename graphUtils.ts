@@ -257,7 +257,7 @@ export function applyOperations(doc: QualiaDoc, operations: IntegrationOperation
             if (!newDoc.nodes[assumptionId]) {
                 // This catches the case where we deleted an assumption but didn't delete the parent.
                 errors.push(
-                    `Conclusion ${node.id} refers to missing assumption ${assumptionId}. If you removed ${assumptionId}, you must also remove ${node.id}.`
+                    `Conclusion ${node.id} refers to missing assumption ${assumptionId}. If you removed the assumption ${assumptionId}, you must also remove its parent conclusion ${node.id}.`
                 );
             }
         }
