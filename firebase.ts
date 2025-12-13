@@ -58,7 +58,7 @@ export function getMessageListener(userId: string, collectionRef: CollectionRefe
         // To prevent triggering when updating the processing status from this client
         // All snapshots are loaded as added on first load
         const doc = change.doc;
-        const data = doc.data() as Communication;
+        const data = { ...doc.data(), id: doc.id } as Communication;
         if (data) {
           const deliveryTime = data.deliveryTime;
           const timeToWait = deliveryTime ? Math.max(0, deliveryTime.toMillis() - Date.now()) : 0;
@@ -89,11 +89,8 @@ async function processData(data: Communication, ref: DocumentReference<DocumentD
       // Deadline not hit yet, some other client is processing
       await new Promise(resolve => setTimeout(resolve, timeToWait));
       const doc = await getDoc(ref);
-      if (doc.exists()) {
-        const data = doc.data() as Communication;
-        if (!data.ack) {
-          return await processData(data, ref, callback);
-        }
+      if (doc.exists() && !doc.data()!.ack) {
+        return await processData(data, ref, callback);
       }
     };
   }

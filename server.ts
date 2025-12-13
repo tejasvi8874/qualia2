@@ -309,7 +309,14 @@ async function getValidCommunication(communication: Communication): Promise<Comm
         if (communication.fromQualiaId === undefined) {
             communication.fromQualiaId = await getUserId();
         } else if (communication.fromQualiaId !== await getUserId()) {
-            errorMessage += `Invalid fromQualiaId for QUALIA_TO_HUMAN: ${communication.fromQualiaId}. Your qualiaId is ${await getUserId()}.\n`;
+            // Sending message on some other qualia's behalf
+            const contacts = await getContacts();
+            const contact = contacts.find((contact) => contact.qualiaId === communication.fromQualiaId);
+            if (!contact) {
+                errorMessage += `The fromQualiaId for QUALIA_TO_HUMAN: ${communication.fromQualiaId} was not found in any of the previous communications. Your qualiaId is ${await getUserId()}. To send communication to your human counterpart on some other qualia's behalf, there must be atleast one communication with the other qualia to prevents incorrect qualia ID issues.\n`;
+            } else if (!communication.fromQualiaName) {
+                communication.fromQualiaName = contact.names[0];
+            }
         }
         if (communication.toQualiaId === undefined) {
             communication.toQualiaId = await getUserId();
