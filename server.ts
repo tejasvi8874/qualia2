@@ -27,7 +27,7 @@ Runs in background, handles all communications. Designed to run on device or in 
 */
 
 
-import { communicationsCollection, contactsCollection, getMessageListener, getUserId, qualiaDocsCollection } from "./firebase";
+import { communicationsCollection, contactsCollection, getMessageListener, getUserId, qualiaDocOperationsCollection, qualiaDocsCollection } from "./firebase";
 import { getContacts, getQualia } from "./firebaseClientUtils";
 import { ai, db } from "./firebaseAuth";
 import { BASE_QUALIA } from "./constants";
@@ -541,6 +541,15 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
         });
 
         console.log(`Created new qualia doc: ${newQualiaDocRef.id} from integration`);
+
+        // Store operations record
+        await addDoc(await qualiaDocOperationsCollection(), {
+            qualiaId: qualiaId,
+            qualiaDocId: newQualiaDocRef.id,
+            operations: lastOperations!,
+            communicationIds: pendingCommunications.map(c => c.id).filter((id): id is string => !!id),
+            createdTime: Timestamp.now()
+        });
 
         // Mark communications as acked
         await markCommunicationsAsAcked(pendingCommunications);

@@ -39,6 +39,10 @@ export async function qualiaDocsCollection() {
   await getUserId();
   return collection(db, "qualiaDocs");
 }
+export async function qualiaDocOperationsCollection() {
+  await getUserId();
+  return collection(db, "qualiaDocOperations");
+}
 
 export function getMessageListener(userId: string, collectionRef: CollectionReference<DocumentData, DocumentData>, echoFilter: QueryCompositeFilterConstraint, callback: (communication: Communication) => Promise<void>, singleListener: boolean, processedField: string = "ack") {
   console.log(`Registering message listener for userId: ${userId} and communicationTypeFilter: ${JSON.stringify(echoFilter)}`);

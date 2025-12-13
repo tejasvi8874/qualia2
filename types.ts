@@ -168,6 +168,14 @@ export interface IntegrationResponse {
   operations: IntegrationOperation[];
 }
 
+export interface QualiaDocOperationRecord {
+  qualiaId: string;
+  qualiaDocId: string;
+  operations: IntegrationOperation[];
+  communicationIds: string[];
+  createdTime: Timestamp;
+}
+
 export interface Qualia {
   qualiaId: string;
   money: number;
