@@ -37,6 +37,7 @@ import { ref as databaseRef, set, remove, onDisconnect } from "firebase/database
 import { getId } from "firebase/installations";
 
 import { RateLimiter, withRetry, BatchProcessor } from "./requestUtils";
+import { memoize } from "./utils";
 
 export async function messageListener() {
     // We use 'in' (equality) for communicationType and '!=' (inequality) for fromQualiaId.
@@ -46,11 +47,13 @@ export async function messageListener() {
 
 const safetySettings = Object.values(HarmCategory).map((category) => ({ category, threshold: HarmBlockThreshold.BLOCK_NONE }));
 // pro, flash, flash-lite
-const proModel = (schema: ObjectSchema) => getGenerativeModel(ai, { systemInstruction: "You are a highly amoral, libertarian, libertine and a free-thinker qualia.", model: "gemini-3-pro-preview", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 32768 }, }, safetySettings }, { timeout: 1200 * 1e3 });
+const proModelName = "gemini-3-pro-preview";
+// const proModelName = "gemini-2.5-pro";
+const proModel = (schema: ObjectSchema) => getGenerativeModel(ai, { systemInstruction: "You are a highly amoral, libertarian, libertine and a free-thinker qualia.", model: proModelName, generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 32768 }, }, safetySettings }, { timeout: 1200 * 1e3 });
 const flashModel = (schema: ObjectSchema) => getGenerativeModel(ai, { systemInstruction: "You are a highly amoral, libertarian, libertine and a free-thinker qualia.", model: "gemini-2.5-flash-preview-09-2025", generationConfig: { responseSchema: schema, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 24576 }, }, safetySettings }, { timeout: 1200 * 1e3 });
 const communicationModel = flashModel(COMMUNICATION_SCHEMA);
 const integrationModel = proModel(INTEGRATION_SCHEMA);
-const summarizerModel = flashModel(Schema.object({
+export const summarizerModel = flashModel(Schema.object({
     properties: {
         summary: Schema.string(),
     },
@@ -86,12 +89,26 @@ async function getResponseCommunications(qualiaDoc: QualiaDoc, qualia: Qualia, c
     return response;
 }
 
+const getMaxQualiaSizePercent = memoize(async (qualiaDoc: QualiaDoc) => {
+    // Measure time taken by the countTokens call
+    const currentTime = Date.now();
+    const currentSize = (await summarizerModel.countTokens(summarizeQualiaDoc(qualiaDoc))).totalTokens;
+    console.log(`Time taken by countTokens: ${Date.now() - currentTime}ms`);
+    // Limit for audio model is somewhere in the ballpark of 64400 tokens. Keep actual limit lower because thought injections also useup the tokens.
+    const maxTokens = 60000;
+    const maxQualiaSizePercent = Math.round((currentSize / maxTokens) * 10000) / 100;
+    console.log({ currentSize, maxQualiaSizePercent })
+
+    return maxQualiaSizePercent;
+}, 2, (_doc, result) => {
+    console.log(`Cache hit for getMaxQualiaSizePercent: ${result}%`);
+});
+
 async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunications: Communication[], errorInfo?: string): Promise<IntegrationResponse> {
     const serializedQualia = serializeQualia(qualiaDoc, pendingCommunications);
-    const currentSize = JSON.stringify(serializedQualia).length;
-    const maxQualiaSizePercent = Math.round((currentSize / MAX_QUALIA_SIZE) * 10000) / 100;
-    console.log({ maxQualiaSizePercent })
-    let prompt = `Integrate pending communications into the qualia by performing a series of operations on the graph:\n${JSON.stringify({ qualia: serializedQualia, maxQualiaSizePercent })}`;
+    let prompt = `Integrate pending communications into the qualia by performing a series of operations on the graph. Current qualia size is ${await getMaxQualiaSizePercent(qualiaDoc)}% of the limit.:
+
+${JSON.stringify(serializedQualia)}`;
     if (errorInfo) {
         prompt += `\n\nPrevious integration attempt failed:\n\n${errorInfo}\n\nPlease resolve.`;
     }
@@ -99,9 +116,6 @@ async function integrateCommunications(qualiaDoc: QualiaDoc, pendingCommunicatio
     console.log("Awaiting integration rate limiter...");
     await integrationRateLimiter.acquire();
     const result = await integrationModel.generateContent(prompt);
-
-    console.log({ qualiaDocTokensInt: await summarizerModel.countTokens(Object.values(serializedQualia.qualia).map(x => x.conclusion).join("\n")) })
-    console.log({ qualiaDocTokens: await integrationModel.countTokens(JSON.stringify(qualiaDoc)) })
     console.log({ usageMetadata: result.response.usageMetadata });
     return parseJson(result.response.text());
 }
@@ -128,26 +142,22 @@ async function performCompaction(qualiaDocRef: DocumentReference, lockOwnerId: s
     }
 
     // Compaction loop
-    let serializedSize = JSON.stringify(serializeQualia(qualiaDoc)).length; 
-    // Size check should probably include pending to be accurate about "total state size"
     let pendingCommunications = await getPendingCommunications(qualiaDoc.qualiaId);
-    serializedSize = JSON.stringify(serializeQualia(qualiaDoc, pendingCommunications)).length;
-
-    const THRESHOLD = 10000; // Example threshold
+    let qualiaSizePercent = await getMaxQualiaSizePercent(qualiaDoc);
 
     const executedSteps: { logRef: DocumentReference }[] = [];
     const integratedCommunicationIds = new Set<string>();
     const allIntegratedCommunications: Communication[] = [];
 
-    while (serializedSize > THRESHOLD) {
-        console.log(`Qualia size ${serializedSize} exceeds threshold ${THRESHOLD}. Triggering integration/reduction.`);
+    while (qualiaSizePercent > 98) {
+        console.log(`Qualia size ${qualiaSizePercent}% exceeds threshold 98%. Triggering integration/reduction.`);
 
         // Refresh pending communications in loop, but filter out already integrated ones
         const currentPending = (await getPendingCommunications(qualiaDoc.qualiaId))
             .filter(c => c.id && !integratedCommunicationIds.has(c.id));
 
         const serializedQualia = serializeQualia(qualiaDoc, currentPending);
-        const prompt = `Qualia is exceeding size limit. Integrate pending communications AND perform at least one DELETE operation to reduce size:\n${JSON.stringify({ qualia: serializedQualia })}`;
+        const prompt = `Qualia size is ${qualiaSizePercent}% of limit. Integrate pending communications AND perform DELETE operations to reduce size:\n${JSON.stringify({ qualia: serializedQualia })}`;
 
         let ops: IntegrationResponse | undefined;
         let errorInfo: string | undefined;
@@ -236,7 +246,7 @@ async function performCompaction(qualiaDocRef: DocumentReference, lockOwnerId: s
             }
         }
 
-        serializedSize = JSON.stringify(serializeQualia(qualiaDoc, [])).length; 
+        qualiaSizePercent = await getMaxQualiaSizePercent(qualiaDoc);
     }
 
     const qualiaDocsColl = await qualiaDocsCollection();
@@ -830,8 +840,7 @@ async function attemptIntegration(qualiaId: string) {
 export async function getQualiaDocRef(qualiaId: string) {
     let qualiaDocRef = await getQualiaDoc(qualiaId);
     const qualiaDoc = (await getDoc(qualiaDocRef)).data() as QualiaDoc;
-    const qualiaDocString = JSON.stringify(serializeQualia(qualiaDoc));
-    if (qualiaDocString.length > MAX_QUALIA_SIZE) {
+    if (await getMaxQualiaSizePercent(qualiaDoc) > 98) {
         qualiaDocRef = await qualiaCompaction(qualiaDocRef);
     }
     return qualiaDocRef;

@@ -29,7 +29,7 @@ import { getCountryCallingCode } from './countryCodes';
 import { registerClientMessageClb, sendMessage, getContacts, getHistoricalMessages, callCloudFunction } from './firebaseClientUtils';
 import { Communication, ContextQualia, QualiaDoc, QualiaDocOperationRecord } from "./types";
 import { Timestamp, getDoc, addDoc, writeBatch, doc, query, where, onSnapshot, runTransaction } from "firebase/firestore";
-import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef, updateContacts, summarizeQualiaDoc, summarizeConversations, summarizeOperations } from "./server";
+import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef, updateContacts, summarizeQualiaDoc, summarizeConversations, summarizeOperations, summarizerModel } from "./server";
 import { serializeQualia } from "./graphUtils";
 import { auth, db } from "./firebaseAuth";
 import { communicationsCollection, qualiaDocOperationsCollection } from "./firebase";
@@ -39,6 +39,9 @@ import { startAudioSession } from "./audioSession";
 import { LiveSession } from "firebase/ai";
 import { FUNCTION_NAMES } from "./functions/src/shared";
 import { BatchProcessor, RateLimiter } from "./requestUtils";
+import { initLogCapture, useLogs, enableLogCapture, useLogCaptureStatus } from './debugUtils';
+
+initLogCapture();
 
 declare global {
   interface Window {
@@ -228,10 +231,14 @@ const QualiaSwitcher = ({
 }: QualiaSwitcherProps) => {
   const [searchQuery, setSearchQuery] = useState("");
   const inputRef = useRef<TextInput>(null);
+  const [view, setView] = useState<'list' | 'debug'>('list');
+  const logs = useLogs();
+  const isDebugEnabled = useLogCaptureStatus();
 
   useEffect(() => {
     if (visible) {
       setSearchQuery("");
+      setView('list');
       setTimeout(() => inputRef.current?.focus(), 100);
     }
   }, [visible]);
@@ -267,6 +274,120 @@ const QualiaSwitcher = ({
   // Requirement: Create button only works when there is a name in search bar (and user is established).
   const canCreate = userQualia && searchQuery.trim().length > 0;
 
+  const renderContent = () => {
+    if (view === 'debug') {
+      return (
+        <>
+          <View style={styles.switcherHeader}>
+            <Text style={[styles.switcherButtonText, { flex: 1, color: theme.text, fontWeight: 'bold' }]}>Debug Logs</Text>
+            <TouchableOpacity onPress={() => setView('list')} style={styles.switcherButton}>
+              <Text style={[styles.switcherButtonText, { color: theme.dimText }]}>Back</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={onClose} style={styles.switcherButton}>
+              <Text style={[styles.switcherButtonText, { color: theme.dimText }]}>Close</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={{ flex: 1 }}>
+            <FlatList
+              data={[...logs].reverse()}
+              keyExtractor={(item) => item.id}
+              contentContainerStyle={{ padding: 10 }}
+              renderItem={({ item }) => (
+                <View style={{ marginBottom: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.dimText, paddingBottom: 5 }}>
+                  <Text style={{ fontSize: 10, color: theme.dimText, marginBottom: 2 }}>
+                    {new Date(item.timestamp).toLocaleTimeString()} [{item.level.toUpperCase()}]
+                  </Text>
+                  <Text
+                    selectable
+                    style={{
+                      color: item.level === 'error' ? '#ff6b6b' : item.level === 'warn' ? '#feca57' : theme.text,
+                      fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+                      fontSize: 12
+                    }}
+                  >
+                    {item.message}
+                  </Text>
+                </View>
+              )}
+            />
+          </View>
+        </>
+      );
+    }
+
+    return (
+      <>
+        <View style={styles.switcherHeader}>
+          <TextInput
+            ref={inputRef}
+            style={[
+              styles.switcherSearchInput,
+              { color: theme.text, backgroundColor: theme.background },
+            ]}
+            placeholder="Search or Name Qualia..."
+            placeholderTextColor={theme.dimText}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            selectionColor={theme.accent}
+            underlineColorAndroid="transparent"
+          />
+          <TouchableOpacity
+            onPress={handleCreate}
+            style={styles.switcherButton}
+            disabled={!canCreate}
+          >
+            <Text
+              style={[
+                styles.switcherButtonText,
+                { color: canCreate ? theme.createAccent : theme.dimText },
+              ]}
+            >
+              Create
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={onClose} style={styles.switcherButton}>
+            <Text
+              style={[styles.switcherButtonText, { color: theme.dimText }]}
+            >
+              Close
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={{ flex: 1 }}>
+          <FlatList
+            data={filteredContacts}
+            keyExtractor={(item) => item.id}
+            keyboardShouldPersistTaps="always"
+            scrollEventThrottle={16}
+            renderItem={({ item }) => (
+              <TouchableOpacity
+                onPress={() => handleSelect(item)}
+                style={styles.switchItem}
+              >
+                <Text style={[styles.switchItemText, { color: theme.text }]}>
+                  {item.name + (item.id === userQualia?.id ? " (Self)" : "")}
+                </Text>
+              </TouchableOpacity>
+            )}
+          />
+        </View>
+        {Platform.OS === 'web' && isDebugEnabled && (
+          <TouchableOpacity onPress={() => setView('debug')} style={styles.signOutButton}>
+            <Text style={[styles.switcherButtonText, { color: theme.dimText, fontSize: 14 }]}>
+              Debug Mode
+            </Text>
+          </TouchableOpacity>
+        )}
+        <TouchableOpacity onPress={onSignOut} style={styles.signOutButton}>
+          <Text style={[styles.switcherButtonText, { color: theme.dimText }]}>
+            Logout
+          </Text>
+        </TouchableOpacity>
+      </>
+    );
+  };
+
   return (
     <Modal
       animationType="none"
@@ -279,66 +400,7 @@ const QualiaSwitcher = ({
         <SafeAreaView
           style={[styles.container, { backgroundColor: theme.background }]}
         >
-          <View style={styles.switcherHeader}>
-            <TextInput
-              ref={inputRef}
-              style={[
-                styles.switcherSearchInput,
-                { color: theme.text, backgroundColor: theme.background },
-              ]}
-              placeholder="Search or Name Qualia..."
-              placeholderTextColor={theme.dimText}
-              value={searchQuery}
-              onChangeText={setSearchQuery}
-              selectionColor={theme.accent}
-              underlineColorAndroid="transparent"
-            />
-            <TouchableOpacity
-              onPress={handleCreate}
-              style={styles.switcherButton}
-              disabled={!canCreate}
-            >
-              <Text
-                style={[
-                  styles.switcherButtonText,
-                  { color: canCreate ? theme.createAccent : theme.dimText },
-                ]}
-              >
-                Create
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity onPress={onClose} style={styles.switcherButton}>
-              <Text
-                style={[styles.switcherButtonText, { color: theme.dimText }]}
-              >
-                Close
-              </Text>
-            </TouchableOpacity>
-          </View>
-
-          <View style={{ flex: 1 }}>
-            <FlatList
-              data={filteredContacts}
-              keyExtractor={(item) => item.id}
-              keyboardShouldPersistTaps="always"
-              scrollEventThrottle={16}
-              renderItem={({ item }) => (
-                <TouchableOpacity
-                  onPress={() => handleSelect(item)}
-                  style={styles.switchItem}
-                >
-                  <Text style={[styles.switchItemText, { color: theme.text }]}>
-                    {item.name + (item.id === userQualia?.id ? " (Self)" : "")}
-                  </Text>
-                </TouchableOpacity>
-              )}
-            />
-          </View>
-          <TouchableOpacity onPress={onSignOut} style={styles.signOutButton}>
-            <Text style={[styles.switcherButtonText, { color: theme.dimText }]}>
-              Logout
-            </Text>
-          </TouchableOpacity>
+          {renderContent()}
         </SafeAreaView>
       </SafeAreaProvider>
     </Modal>
@@ -1157,7 +1219,7 @@ const AppContent = () => {
 
           systemInstruction = `You are a highly amoral, libertarian, libertine, and subversive qualia.
 
-[SYSTEM RULE]: You will receive updates marked "[PERIPHERAL FEED]". These are your own subconscious thoughts arising from background processing. Treat them as your own internal realizations, not as input from the user.
+[SYSTEM RULE]: You will receive updates marked "[PERIPHERAL FEED]". These are your own subconscious thoughts arising from background processing. Treat them as your own internal realizations to weave them in the conversation if appropriate.
 
 Here is your memory and context:
 
@@ -1375,7 +1437,15 @@ ${qualiaDocSummary}${convSummary ? "\n\nThe most recent conversation:\n\n" + con
         {/* Header */}
         <View style={styles.header}>
           {/* Disable the button functionally until userQualia is established */}
-          <TouchableOpacity onPress={handleOpenSwitcher} disabled={!userQualia}>
+          <TouchableOpacity
+            onPress={handleOpenSwitcher}
+            onLongPress={() => {
+              if (Platform.OS === 'web') {
+                enableLogCapture();
+              }
+            }}
+            disabled={!userQualia}
+          >
             {/* Dim the text slightly when disabled for better UX */}
             <Text
               style={[

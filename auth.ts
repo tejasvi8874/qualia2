@@ -1,5 +1,5 @@
-import { initializeApp } from "firebase/app";
-import { getAuth, signInWithPhoneNumber, RecaptchaVerifier } from "firebase/auth";
+import { FirebaseApp, initializeApp } from "firebase/app";
+import { getAuth, signInWithPhoneNumber, RecaptchaVerifier, Auth } from "firebase/auth";
 import { firebaseConfig } from "./firebaseConfig";
 
 // This script is self-contained and runs inside the native WebView.
@@ -12,8 +12,8 @@ const log = (message: any) => post({ type: 'log', message });
 post({ type: 'ready' });
 log('Auth WebView script loaded');
 
-let app: any;
-let auth: any;
+let app: FirebaseApp;
+let auth: Auth;
 
 const ensureApp = () => {
     if (app) return;

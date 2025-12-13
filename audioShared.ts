@@ -55,6 +55,7 @@ export async function processStreamMessages(
 
     try {
         for await (const message of messageStream) {
+            console.log(message)
             if (message.type === "serverContent") {
                 if (message.inputTranscription?.text) {
                     flushModel();
