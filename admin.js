@@ -1158,4 +1158,4 @@ async function verifyDamage(lastLargeDocId = 'PPFirvKepCqVi6LADBTZ') {
 }
 
 // Execute verification
-verifyDamage();
+findHugeDiff();

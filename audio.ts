@@ -109,20 +109,23 @@ const handleMessage = (event: any) => {
                 ? JSON.parse(event.data)
                 : event.data;
 
-        if (data.type === "start") {
-            startAudioConversationWithInstruction(
-                data.systemInstruction,
-                data.idToken,
-            );
-        } else if (data.type === "stop") {
-            if (liveSession) {
-                liveSession.close();
-            }
-        } else if (data.type === "send") {
-            if (liveSession) {
-                log(`Sending message to audio session: ${data.message}`);
-                liveSession.send(data.message);
-            }
+        switch (data.type) {
+            case "start":
+                startAudioConversationWithInstruction(
+                    data.systemInstruction,
+                    data.idToken,
+                );
+            case "stop":
+                if (liveSession) {
+                    liveSession.close();
+                }
+            case "sendFunctionResponses":
+                if (liveSession) {
+                    log(`Sending message to audio session: ${data.message}`);
+                    liveSession.sendFunctionResponses(data.message);
+                }
+            default:
+                throw new Error(`Unknown message type: ${data.type}`);
         }
     } catch (e: any) {
         log(`Error processing message: ${e?.message || e} `);

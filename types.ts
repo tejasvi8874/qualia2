@@ -171,7 +171,8 @@ export interface IntegrationResponse {
 
 export interface QualiaDocOperationRecord {
   qualiaId: string;
-  qualiaDocId: string;
+  oldQualiaDocId: string;
+  newQualiaDocId?: string;
   operations: IntegrationOperation[];
   communicationIds: string[];
   createdTime: Timestamp;

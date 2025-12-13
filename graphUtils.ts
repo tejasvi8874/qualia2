@@ -182,7 +182,7 @@ export class BaseGraphCorruptionError extends Error {
 
 export class GraphValidationError extends Error {
     constructor(message: string, operations: IntegrationOperation[]) {
-        super(`Validation failed:\n\n${message}\n\n Attempted operations:\n\n${JSON.stringify(operations)}`);
+        super(`Validation failed:\n\n${message}\n\nAttempted operations:\n\n${JSON.stringify(operations)}`);
         this.name = "GraphValidationError";
     }
 }

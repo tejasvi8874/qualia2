@@ -13,6 +13,9 @@ import {
     doc,
     onSnapshot,
     or,
+    Transaction,
+    collection,
+    getDocsFromServer,
 } from "firebase/firestore";
 import { getGenerativeModel, HarmBlockThreshold, HarmCategory, ObjectSchema, GenerativeModel, Schema } from "firebase/ai";
 
@@ -27,7 +30,7 @@ Runs in background, handles all communications. Designed to run on device or in 
 */
 
 
-import { communicationsCollection, contactsCollection, getMessageListener, getUserId, qualiaDocOperationsCollection, qualiaDocsCollection, runWithLock, getTimeToWait, waitForLockRelease } from "./firebase";
+import { communicationsCollection, contactsCollection, getMessageListener, getUserId, qualiaDocOperationsCollection, qualiaDocsCollection, runWithLock, getTimeToWait, waitForLockRelease, runTransactionWithLockVerification } from "./firebase";
 import { getContacts, getQualia } from "./firebaseClientUtils";
 import { ai, db, rtdb, installations } from "./firebaseAuth";
 import { ref as databaseRef, set, remove, onDisconnect } from "firebase/database";
@@ -105,7 +108,7 @@ const MAX_QUALIA_SIZE = 2 ** 20;
 /*
 Keeps the same qualia doc id and just updates the content. Creates 
 */
-async function performCompaction(qualiaDocRef: DocumentReference): Promise<DocumentReference> {
+async function performCompaction(qualiaDocRef: DocumentReference, lockOwnerId: string): Promise<DocumentReference> {
     const qualiaDocSnapshot = await getDoc(qualiaDocRef);
     if (!qualiaDocSnapshot.exists()) {
         throw new Error("Qualia doc does not exist for compaction");
@@ -116,20 +119,24 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
     }
 
     // Compaction loop
-    let serializedSize = JSON.stringify(serializeQualia(qualiaDoc)).length; // Initial check without pending? Or should we include?
+    let serializedSize = JSON.stringify(serializeQualia(qualiaDoc)).length; 
     // Size check should probably include pending to be accurate about "total state size"
-    const pendingCommunications = await getPendingCommunications(qualiaDoc.qualiaId);
+    let pendingCommunications = await getPendingCommunications(qualiaDoc.qualiaId);
     serializedSize = JSON.stringify(serializeQualia(qualiaDoc, pendingCommunications)).length;
 
     const THRESHOLD = 10000; // Example threshold
 
     const executedSteps: { logRef: DocumentReference }[] = [];
+    const integratedCommunicationIds = new Set<string>();
+    const allIntegratedCommunications: Communication[] = [];
 
     while (serializedSize > THRESHOLD) {
         console.log(`Qualia size ${serializedSize} exceeds threshold ${THRESHOLD}. Triggering integration/reduction.`);
 
-        // Refresh pending communications in loop?
-        const currentPending = await getPendingCommunications(qualiaDoc.qualiaId);
+        // Refresh pending communications in loop, but filter out already integrated ones
+        const currentPending = (await getPendingCommunications(qualiaDoc.qualiaId))
+            .filter(c => c.id && !integratedCommunicationIds.has(c.id));
+
         const serializedQualia = serializeQualia(qualiaDoc, currentPending);
         const prompt = `Qualia is exceeding size limit. Integrate pending communications AND perform at least one DELETE operation to reduce size:\n${JSON.stringify({ qualia: serializedQualia })}`;
 
@@ -153,7 +160,8 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
                     qualiaDoc.qualiaId,
                     lastOperations,
                     currentPending.map(c => c.id).filter((id): id is string => !!id),
-                    undefined, // qualiaDocId: New doc not created yet, will be updated later
+                    qualiaDocRef.id, // oldQualiaDocId
+                    undefined, // newQualiaDocId: New doc not created yet, will be updated later
                     undefined, // error: No error yet
                     ops.reasoning
                 );
@@ -211,30 +219,47 @@ async function performCompaction(qualiaDocRef: DocumentReference): Promise<Docum
             executedSteps.push({ logRef: currentLogRef });
         }
 
-        // Mark integrated communications as acked
-        await markCommunicationsAsAcked(currentPending);
+        // Track integrated communications
+        for (const comm of currentPending) {
+            if (comm.id) {
+                integratedCommunicationIds.add(comm.id);
+                allIntegratedCommunications.push(comm);
+            }
+        }
 
-        serializedSize = JSON.stringify(serializeQualia(qualiaDoc, [])).length; // Check size of graph only? Or fetch pending again?
-        // If we just acked them, they won't be pending anymore.
+        serializedSize = JSON.stringify(serializeQualia(qualiaDoc, [])).length; 
     }
 
-    // After loop, save the compacted qualia to a NEW doc?
-    // User said: "Convert each node and its children to a json format ... and at the end simply serialize the list of jsons."
-    // "The new communications need to be integrated into the qualia ... result of integration is a list of operations"
-    // "Compaction ... trigger integration process ... Stop the loop when ... under limit."
+    const qualiaDocsColl = await qualiaDocsCollection();
+    const newDocRef = doc(qualiaDocsColl);
+    const newQualiaDocRef = newDocRef;
 
-    // It seems compaction IS integration until size is small.
-    // So we just update the CURRENT doc? Or create a new one?
-    // Existing code creates a new doc. Let's stick to that pattern to be safe/immutable-ish.
+    const newDocData = {
+        ...qualiaDoc,
+        nextQualiaDocId: "",
+        createdTime: Timestamp.now()
+    };
 
-    const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), { ...qualiaDoc, nextQualiaDocId: "", createdTime: Timestamp.now() });
     console.log(`New qualia doc created: ${newQualiaDocRef.id}`);
-    await updateDoc(qualiaDocRef, { nextQualiaDocId: newQualiaDocRef.id, processingBefore: null });
 
-    // Update all executed steps with the new qualiaDocId
-    for (const step of executedSteps) {
-        await updateQualiaOperationLog(step.logRef, { qualiaDocId: newQualiaDocRef.id });
-    }
+    // Verify lock ownership before committing
+    await runTransactionWithLockVerification(db, qualiaDocRef, lockOwnerId, async (transaction) => {
+        transaction.set(newDocRef, newDocData);
+        transaction.update(qualiaDocRef, { nextQualiaDocId: newQualiaDocRef.id, processingBefore: null });
+
+        // Update all executed steps with the new qualiaDocId
+        for (const step of executedSteps) {
+            transaction.update(step.logRef, { newQualiaDocId: newQualiaDocRef.id });
+        }
+
+        // Ack all integrated communications
+        const commsColl = await communicationsCollection();
+        for (const comm of allIntegratedCommunications) {
+            if (comm.id) {
+                transaction.update(doc(commsColl, comm.id), { ack: true });
+            }
+        }
+    });
 
     return newQualiaDocRef;
 }
@@ -252,9 +277,9 @@ async function qualiaCompaction(qualiaDocRef: DocumentReference): Promise<Docume
     // Let's try to claim.
     const result = await runWithLock(
         qualiaDocRef,
-        async (lock) => {
+        async (lockOwnerId) => {
             try {
-                const newQualiaDocRef = await performCompaction(qualiaDocRef);
+                const newQualiaDocRef = await performCompaction(qualiaDocRef, lockOwnerId);
                 console.log(`Compaction complete. Existing doc ${qualiaDocRef.id} updated with new content.`);
                 return newQualiaDocRef;
             } catch (error) {
@@ -299,24 +324,32 @@ async function qualiaCompaction(qualiaDocRef: DocumentReference): Promise<Docume
 /*
     Merges the new names with the existing ones.
 */
-export async function updateContacts(contacts: Contact[]): Promise<void> {
+export async function updateContacts(contacts: Contact[], transaction: Transaction): Promise<void> {
     console.log(`Updating contacts: ${JSON.stringify(contacts)}`);
     const q = query(
         await contactsCollection(),
         where("qualiaId", "==", await getUserId())
     );
+
+    // We query outside the transaction to get the doc ref
     const snapshot = await getDocs(q);
     const docs = snapshot.docs;
+
     if (docs.length === 0) {
-        await addDoc(await contactsCollection(), {
+        const newDocRef = doc(await contactsCollection());
+        transaction.set(newDocRef, {
             qualiaId: await getUserId(),
             qualiaContacts: contacts,
         });
     } else if (docs.length === 1) {
-        // Later rewrite this to extract compaction in a separate function
         const docRef = docs[0].ref;
-        const existingContacts = docs[0].data() as Contacts;
+        // Re-read inside transaction for lock and consistency
+        const docSnap = await transaction.get(docRef);
+        if (!docSnap.exists()) throw new Error("Contacts doc missing during transaction");
+
+        const existingContacts = docSnap.data() as Contacts;
         const existingQualiaContacts = existingContacts.qualiaContacts || [];
+
         // merge existing contacts with new contacts
         const qualiaIdMap = new Map<string, Contact>();
 
@@ -338,7 +371,8 @@ export async function updateContacts(contacts: Contact[]): Promise<void> {
             qualiaIdMap.set(qualiaId, contact);
         }
         const mergedContacts = Array.from(qualiaIdMap.values());
-        await updateDoc(docRef, { qualiaContacts: mergedContacts });
+
+        transaction.update(docRef, { qualiaContacts: mergedContacts });
         console.log(`Contacts updated successfully`);
     } else {
         console.error("Duplicate contacts found");
@@ -366,69 +400,90 @@ const messageBatchProcessor = new BatchProcessor<Communication>(
         for (const [qualiaId, communications] of messagesByQualia) {
             try {
                 const qualiaDocRef = await getQualiaDocRef(qualiaId);
-                let qualiaDoc = (await getDoc(qualiaDocRef)).data() as QualiaDoc;
-                const qualia = await getQualia(qualiaId);
 
-                // Update contacts for all communications
-                const contacts: Contact[] = [];
-                for (const comm of communications) {
-                    if (comm.fromQualiaId) {
-                        contacts.push({
-                            names: comm.fromQualiaName ? [comm.fromQualiaName] : [],
-                            qualiaId: comm.fromQualiaId,
-                            lastContactTime: Timestamp.now()
-                        });
+                await runWithLock(qualiaDocRef, async (lockOwnerId) => {
+                    console.log(`Processing message batch for qualia ${qualiaId} with lock`);
+
+                    // We need to read the Qualia doc inside the lock (or verify it hasn't changed significantly?)
+                    // Actually, we just need the latest state for context.
+                    // But for transaction, we need to read inside transaction if we want to update it?
+                    // We are NOT updating Qualia doc here (except maybe indirectly via integration trigger later).
+                    // But we ARE updating contacts and communications.
+
+                    // Fetch fresh data for context
+                    const docSnap = await getDoc(qualiaDocRef);
+                    const qualiaDoc = docSnap.data() as QualiaDoc;
+                    const qualia = await getQualia(qualiaId);
+
+                    // Generate response for the batch
+                    // Note: We generate response BEFORE transaction to avoid long-running transaction (LLM call).
+                    // This means if state changes during generation, we might be slightly stale.
+                    // But we are locked, so state shouldn't change much (except maybe other non-locked updates?).
+                    // Integration/Compaction also locks.
+                    // So we are safe from those.
+
+                    // 1. Prepare contact updates (incoming)
+                    const incomingContacts: Contact[] = [];
+                    for (const comm of communications) {
+                        if (comm.fromQualiaId) {
+                            incomingContacts.push({
+                                names: comm.fromQualiaName ? [comm.fromQualiaName] : [],
+                                qualiaId: comm.fromQualiaId,
+                                lastContactTime: Timestamp.now()
+                            });
+                        }
                     }
-                    // Mark as received
-                    if (comm.id) {
-                        const commRef = doc(await communicationsCollection(), comm.id);
-                        await updateDoc(commRef, { receivedTime: Timestamp.now() });
+
+                    // 2. Generate response
+                    const response = await getResponseCommunications(qualiaDoc, qualia, communications);
+                    const validCommunications: Communication[] = [];
+                    if (response.communications.length > 0) {
+                        for (const comm of response.communications) {
+                            validCommunications.push(await getValidCommunication(comm));
+                        }
+                    } else {
+                        console.log(`No new communications generated for batch.`);
                     }
-                }
-                await updateContacts(contacts);
 
-                // Generate response for the batch
-                // We pass the last communication as the "trigger" but the prompt will include all pending
-                // Actually, getResponseCommunications fetches pending communications internally.
-                // So we just need to trigger it once per Qualia.
-                // However, we should pass the *new* messages as context if they aren't in pending yet?
-                // They SHOULD be in pending because they are in the collection and not acked.
-                // But we might want to pass them explicitly if we want to be sure.
-                // For now, let's assume they are in pending.
-                // We use the last communication to drive the "communication" argument if needed,
-                // or we update getResponseCommunications to take a batch.
-                // Let's update getResponseCommunications to take a batch.
-
-                const response = await getResponseCommunications(qualiaDoc, qualia, communications);
-
-                const validCommunications: Communication[] = [];
-                if (response.communications.length > 0) {
+                    // 3. Prepare contact updates (outgoing)
+                    const outgoingContacts: Contact[] = [];
                     for (const comm of response.communications) {
-                        validCommunications.push(await getValidCommunication(comm));
+                        if (comm.toQualiaName && comm.toQualiaId) {
+                            outgoingContacts.push({
+                                names: [comm.toQualiaName],
+                                qualiaId: comm.toQualiaId,
+                                lastContactTime: Timestamp.now(),
+                            });
+                        }
                     }
-                } else {
-                    console.log(`No new communications generated for batch.`);
-                }
 
-                // Send outgoing messages
-                await Promise.all(validCommunications.map(comm => communicationsCollection().then(
-                    collection => addDoc(collection, comm))));
+                    const allContactsToUpdate = [...incomingContacts, ...outgoingContacts];
 
-                // Update contacts from outgoing messages
-                const outgoingContacts: Contact[] = [];
-                for (const comm of response.communications) {
-                    if (comm.toQualiaName && comm.toQualiaId) {
-                        outgoingContacts.push({
-                            names: [comm.toQualiaName],
-                            qualiaId: comm.toQualiaId,
-                            lastContactTime: Timestamp.now(),
-                        });
-                    }
-                }
-                await updateContacts(outgoingContacts);
+                    // 4. Atomic Commit
+                    await runTransactionWithLockVerification(db, qualiaDocRef, lockOwnerId, async (transaction) => {
+                        // Update contacts
+                        if (allContactsToUpdate.length > 0) {
+                            await updateContacts(allContactsToUpdate, transaction);
+                        }
 
-                // Trigger integration
-                triggerIntegration(qualiaId);
+                        // Mark incoming as received
+                        const commsColl = await communicationsCollection();
+                        for (const comm of communications) {
+                            if (comm.id) {
+                                transaction.update(doc(commsColl, comm.id), { receivedTime: Timestamp.now() });
+                            }
+                        }
+
+                        // Create outgoing messages
+                        for (const comm of validCommunications) {
+                            const newCommRef = doc(commsColl);
+                            transaction.set(newCommRef, comm);
+                        }
+                    });
+
+                    // Trigger integration (outside transaction, it's just a signal)
+                    triggerIntegration(qualiaId);
+                });
 
             } catch (e) {
                 console.error(`Error processing message batch for qualia ${qualiaId}:`, e);
@@ -541,10 +596,11 @@ async function markCommunicationsAsAcked(communications: Communication[]) {
     }
 }
 
-async function logQualiaOperation(qualiaId: string, operations: IntegrationOperation[], communicationIds: string[], qualiaDocId?: string, error?: string, reasoning?: string): Promise<DocumentReference> {
+async function logQualiaOperation(qualiaId: string, operations: IntegrationOperation[], communicationIds: string[], oldQualiaDocId: string, newQualiaDocId?: string, error?: string, reasoning?: string): Promise<DocumentReference> {
     return await addDoc(await qualiaDocOperationsCollection(), {
         qualiaId,
-        qualiaDocId: qualiaDocId || "",
+        oldQualiaDocId: oldQualiaDocId,
+        newQualiaDocId: newQualiaDocId || "",
         operations,
         communicationIds,
         error: error || "",
@@ -553,7 +609,7 @@ async function logQualiaOperation(qualiaId: string, operations: IntegrationOpera
     });
 }
 
-async function updateQualiaOperationLog(logRef: DocumentReference, updates: { qualiaDocId?: string, error?: string }) {
+async function updateQualiaOperationLog(logRef: DocumentReference, updates: { oldQualiaDocId?: string, newQualiaDocId?: string, error?: string }) {
     await updateDoc(logRef, updates);
 }
 
@@ -578,12 +634,21 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
 
     const result = await runWithLock(
         qualiaDocRef,
-        async (lock) => {
+        async (lockOwnerId) => {
             console.log(`Integration started for qualia ${qualiaId}`);
             try {
                 // Fetch fresh data
                 const docSnap = await getDoc(qualiaDocRef);
+                if (!docSnap.exists()) {
+                    console.log(`Qualia doc ${qualiaDocRef.id} does not exist. Skipping.`);
+                    return;
+                }
                 let qualiaDoc = docSnap.data() as QualiaDoc;
+
+                if (qualiaDoc.nextQualiaDocId) {
+                    console.log(`Qualia doc ${qualiaDocRef.id} already integrated. Skipping.`);
+                    return;
+                }
 
                 // Fetch pending communications
                 const pendingCommunications = await getPendingCommunications(qualiaId);
@@ -612,7 +677,8 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
                             qualiaId,
                             lastOperations,
                             pendingCommunications.map(c => c.id).filter((id): id is string => !!id),
-                            undefined, // qualiaDocId: New doc not created yet, will be updated later
+                            qualiaDocRef.id, // oldQualiaDocId
+                            undefined, // newQualiaDocId: New doc not created yet, will be updated later
                             undefined, // error: No error yet
                             integrationResult.reasoning
                         );
@@ -669,31 +735,60 @@ async function attemptIntegration(qualiaDocRef: DocumentReference, qualiaId: str
                     }
                 }
 
-                // Success. Create new doc and link from old.
-                const newQualiaDocRef = await addDoc(await qualiaDocsCollection(), {
-                    ...newDoc!,
-                    nextQualiaDocId: "",
-                    processingBefore: null,
-                    createdTime: Timestamp.now()
-                });
+                let newQualiaDocRef: DocumentReference;
+                const commsColl = await communicationsCollection();
 
-                await updateDoc(qualiaDocRef, {
-                    nextQualiaDocId: newQualiaDocRef.id,
-                    // processingBefore will be cleared by runWithLock auto-release, but setting nextQualiaDocId is the key here.
-                    // Actually, if we set nextQualiaDocId, processingBefore is irrelevant.
-                    // But runWithLock will try to clear processingBefore.
-                    // That's fine.
-                });
+                if (lastOperations && lastOperations.length > 0) {
+                    // Success. Create new doc and link from old.
+                    const qualiaDocsColl = await qualiaDocsCollection();
+                    const newDocRef = doc(qualiaDocsColl);
+                    newQualiaDocRef = newDocRef;
 
-                console.log(`Created new qualia doc: ${newQualiaDocRef.id} from integration`);
+                    const newDocData = {
+                        ...newDoc!,
+                        nextQualiaDocId: "",
+                        processingBefore: null,
+                        createdTime: Timestamp.now()
+                    };
 
-                // Update the successful log with the new qualiaDocId
-                if (currentLogRef) {
-                    await updateQualiaOperationLog(currentLogRef, { qualiaDocId: newQualiaDocRef.id });
+                    // Verify lock ownership before committing
+                    await runTransactionWithLockVerification(db, qualiaDocRef, lockOwnerId, async (transaction) => {
+                        transaction.set(newDocRef, newDocData);
+                        transaction.update(qualiaDocRef, {
+                            nextQualiaDocId: newQualiaDocRef.id,
+                        });
+
+                        // Update the successful log with the new qualiaDocId
+                        if (currentLogRef) {
+                            transaction.update(currentLogRef, { newQualiaDocId: newQualiaDocRef.id });
+                        }
+
+                        // Mark communications as acked
+                        for (const comm of pendingCommunications) {
+                            if (comm.id) {
+                                transaction.update(doc(commsColl, comm.id), { ack: true });
+                            }
+                        }
+                    });
+
+                    console.log(`Created new qualia doc: ${newQualiaDocRef.id} from integration`);
+                } else {
+                    console.log("No operations generated. Skipping new doc creation.");
+                    newQualiaDocRef = qualiaDocRef;
+
+                    // Atomic update for log and acks
+                    await runTransactionWithLockVerification(db, qualiaDocRef, lockOwnerId, async (transaction) => {
+                        if (currentLogRef) {
+                            transaction.update(currentLogRef, { newQualiaDocId: newQualiaDocRef.id });
+                        }
+                        // Ack communications
+                        for (const comm of pendingCommunications) {
+                            if (comm.id) {
+                                transaction.update(doc(commsColl, comm.id), { ack: true });
+                            }
+                        }
+                    });
                 }
-
-                // Mark communications as acked
-                await markCommunicationsAsAcked(pendingCommunications);
 
                 console.log("Integration successful.");
 
@@ -798,7 +893,11 @@ async function getQualiaDoc(qualiaId: string): Promise<DocumentReference> {
         where("qualiaId", "==", qualiaId),
         where("nextQualiaDocId", "==", "")
     );
-    const snapshot = await getDocs(q);
+    let snapshot = await getDocs(q);
+    if (snapshot.docs.length > 1) {
+        console.warn("Multiple qualia docs found in cache, falling back to server...");
+        snapshot = await getDocsFromServer(q);
+    }
     const docs = snapshot.docs;
     if (docs.length === 0) {
         // Create initial qualia doc
@@ -806,7 +905,8 @@ async function getQualiaDoc(qualiaId: string): Promise<DocumentReference> {
         return await addDoc(await qualiaDocsCollection(), initialQualiaDoc);
     }
     if (docs.length > 1) {
-        throw new Error(`Unique qualia doc not found: ${docs}`);
+        const v = docs.map(d => ({ id: d.id, size: Object.keys(d.data()).length, createdTime: d.data().createdTime.toDate(), nextQualiaDocId: d.data().nextQualiaDocId })).map(x => JSON.stringify(x)).join(", ");
+        throw new Error(`Unique qualia doc not found: ${v}`);
     }
     return docs[0].ref;
 }

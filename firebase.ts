@@ -13,8 +13,11 @@ import {
   Timestamp,
   updateDoc,
   where,
+  Transaction,
+  DocumentSnapshot,
+  Firestore
 } from "firebase/firestore";
-import { ref as databaseRef, set, remove, onDisconnect } from "firebase/database";
+import { ref as databaseRef, set, remove, onDisconnect, get } from "firebase/database";
 import { getId } from "firebase/installations";
 
 import { db, waitForUser, rtdb, installations } from "./firebaseAuth";
@@ -108,7 +111,7 @@ async function claimAndProcess(ref: DocumentReference<DocumentData, DocumentData
   try {
     const result = await runWithLock(
       ref,
-      async (lock) => {
+      async (_lockOwnerId) => {
         return await callback(data).then(() => updateDoc(ref, { [processedField]: true }));
       },
       PROCESSING_SECONDS,
@@ -142,6 +145,12 @@ export function getTimeToWait(processingBefore: number, maxProcessingSeconds: nu
   return isValidProcessingBefore ? waitTime : 0;
 }
 
+export async function checkLockInRtdb(userId: string, deviceId: string, collectionId: string, docId: string): Promise<boolean> {
+  const lockRef = databaseRef(rtdb, `/locks/${userId}/${deviceId}/${collectionId}/${docId}`);
+  const snapshot = await get(lockRef);
+  return snapshot.exists();
+}
+
 export async function waitForLockRelease(docRef: DocumentReference, maxWaitMs: number): Promise<void> {
   console.log(`Waiting for lock release on ${docRef.id} for max ${maxWaitMs}ms`);
   return new Promise((resolve) => {
@@ -150,12 +159,26 @@ export async function waitForLockRelease(docRef: DocumentReference, maxWaitMs: n
       resolve();
     }, maxWaitMs);
 
-    const unsubscribe = onSnapshot(docRef, (snapshot) => {
+    const unsubscribe = onSnapshot(docRef, async (snapshot) => {
       const data = snapshot.data();
       if (!data || !data.processingBefore) {
         clearTimeout(timeout);
         unsubscribe();
         resolve();
+        return;
+      }
+
+      // Check if the lock owner is still alive in RTDB
+      if (data.lockOwner) {
+        const userId = await getUserId();
+        const collectionId = docRef.parent.id;
+        const isAlive = await checkLockInRtdb(userId, data.lockOwner, collectionId, docRef.id);
+        if (!isAlive) {
+          console.log(`Lock owner ${data.lockOwner} is dead, stopping wait for ${docRef.id}`);
+          clearTimeout(timeout);
+          unsubscribe();
+          resolve();
+        }
       }
     });
   });
@@ -175,8 +198,26 @@ export async function acquireLock(
     if (checkFn && !checkFn(data)) return false;
 
     if (data.processingBefore && getTimeToWait(data.processingBefore.toMillis(), durationSeconds * 2) > 0) {
-      console.log(`Lock already held for ${docRef.id}`);
-      return false;
+      // Lock is held, check if owner is alive
+      if (data.lockOwner) {
+        const userId = await getUserId();
+        const collectionId = docRef.parent.id;
+        // We need to check RTDB. Since we can't do async RTDB calls inside a Firestore transaction easily 
+        // (it might delay the transaction too much or be disallowed depending on client SDK strictness, 
+        // but usually it's fine in JS SDK as long as we await), let's try.
+        // Actually, for performance, we might want to check this *before* the transaction?
+        // But we need the lockOwner from the doc.
+        // Let's do it here. If it fails or takes too long, the transaction might retry.
+        const isAlive = await checkLockInRtdb(userId, data.lockOwner, collectionId, docRef.id);
+        if (isAlive) {
+          console.log(`Lock already held for ${docRef.id} by alive owner ${data.lockOwner}`);
+          return false;
+        }
+        console.log(`Lock held by dead owner ${data.lockOwner}, stealing lock for ${docRef.id}`);
+      } else {
+        console.log(`Lock held but no owner recorded for ${docRef.id}`);
+        return false;
+      }
     }
 
     transaction.update(docRef, {
@@ -185,6 +226,23 @@ export async function acquireLock(
     });
     console.log(`Acquired lock for ${docRef.id}`);
     return true;
+  });
+}
+
+export async function runTransactionWithLockVerification<T>(
+  db: Firestore,
+  lockDocRef: DocumentReference,
+  lockOwnerId: string,
+  updateFunction: (transaction: Transaction, lockDoc: DocumentSnapshot) => Promise<T>
+): Promise<T> {
+  return runTransaction(db, async (transaction) => {
+    const docSnap = await transaction.get(lockDocRef);
+    if (!docSnap.exists()) throw new Error("Lock doc does not exist");
+    const data = docSnap.data();
+    if (data?.lockOwner !== lockOwnerId) {
+      throw new Error(`Lock stolen. Expected ${lockOwnerId}, got ${data?.lockOwner}`);
+    }
+    return updateFunction(transaction, docSnap);
   });
 }
 
@@ -212,14 +270,17 @@ export interface Lock {
 
 export async function runWithLock<T>(
   docRef: DocumentReference,
-  work: (lock: Lock) => Promise<T>,
+  work: (lockOwnerId: string) => Promise<T>,
   durationSeconds: number = PROCESSING_SECONDS,
   checkFn?: (data: DocumentData) => boolean
 ): Promise<T | undefined> {
-  if (await acquireLock(docRef, durationSeconds, checkFn)) {
-    console.log(`Acquired lock for ${docRef.id}`);
-    return await withDeviceLock(docRef, async () => {
-      console.log(`Acquired device lock for ${docRef.id}`);
+  // Acquire RTDB lock FIRST to signal liveness
+  return await withDeviceLock(docRef, async () => {
+    console.log(`Acquired device lock for ${docRef.id}`);
+
+    if (await acquireLock(docRef, durationSeconds, checkFn)) {
+      console.log(`Acquired firestore lock for ${docRef.id}`);
+
       let released = false;
       const release = async () => {
         if (!released) {
@@ -230,26 +291,21 @@ export async function runWithLock<T>(
       };
 
       try {
-        const result = await work({ release });
+        const lockOwnerId = await getLockOwnerId();
+        const result = await work(lockOwnerId);
         // Auto-release on success if not already released
         await release();
         console.log(`Released lock for ${docRef.id}`);
         return result;
       } catch (e) {
-        // Auto-release on error too?
-        // Yes, if we failed, we should probably release the lock so others can retry?
-        // Or do we want to keep it locked to prevent rapid retries of failing jobs?
-        // Usually, if it's a transient error, we might want to release.
-        // If it's a permanent failure, we might want to handle it differently.
-        // But for "processingBefore", it's a timeout lock. Releasing it is generally safer than holding it for the full timeout.
         await release();
-        console.error(`Failed to release lock for ${docRef.id}: ${e}`, e.stack);
+        console.error(`Failed to release lock for ${docRef.id}: ${e}`, e instanceof Error ? e.stack : '');
         throw e;
       }
-    });
-  }
-  console.debug(`Failed to acquire lock for ${docRef.id}`)
-  return undefined;
+    }
+    console.debug(`Failed to acquire firestore lock for ${docRef.id}`)
+    return undefined;
+  });
 }
 
 let cachedLockOwnerId: string | null = null;
@@ -264,5 +320,6 @@ async function getLockOwnerId(): Promise<string> {
       cachedLockOwnerId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
     }
   }
+  console.log("Lock owner ID:", cachedLockOwnerId);
   return cachedLockOwnerId!;
 }

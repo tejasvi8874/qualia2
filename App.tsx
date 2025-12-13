@@ -25,7 +25,7 @@ import { AudioModule } from 'expo-audio';
 import { File } from 'expo-file-system';
 import { registerClientMessageClb, sendMessage, getContacts, getHistoricalMessages, callCloudFunction } from './firebaseClientUtils';
 import { Communication, ContextQualia, QualiaDoc, QualiaDocOperationRecord } from "./types";
-import { Timestamp, getDoc, addDoc, writeBatch, doc, query, where, onSnapshot } from "firebase/firestore";
+import { Timestamp, getDoc, addDoc, writeBatch, doc, query, where, onSnapshot, runTransaction } from "firebase/firestore";
 import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef, updateContacts, summarizeQualiaDoc, summarizeConversations, summarizeOperations } from "./server";
 import { serializeQualia } from "./graphUtils";
 import { auth, db } from "./firebaseAuth";
@@ -581,7 +581,9 @@ const AppContent = () => {
             const newUserQualia = { id: userId, name: name, lastContactTime: Timestamp.now() };
             setUserQualia(newUserQualia);
             setActiveQualia(newUserQualia);
-            updateContacts([{ qualiaId: userId, names: [name], lastContactTime: Timestamp.now() }]);
+            runTransaction(db, async (transaction) => {
+              await updateContacts([{ qualiaId: userId, names: [name], lastContactTime: Timestamp.now() }], transaction);
+            });
           }
         }
       });
@@ -1040,7 +1042,7 @@ const AppContent = () => {
           const qualiaDocSummary = summarizeQualiaDoc(qualiaDoc);
           const convSummary = summarizeConversations(pendingCommunications, qualiaDocSummary);
 
-          systemInstruction = `You are a qualia.\n\nNote: You may receive user messages indicating your subconscious thoughts. These are your own internal realizations and NOT dialogue from the user. These thoughts might or might not affect subsequent conversation with the user and do NOT directly reference these thoughts or ANY other subconscious thoughts in your response in any way. The user provided thoughts will end with (end subconscious thoughts).\n\nHere is your memory and context:\n${JSON.stringify({ myQualiaId: activeQualia.id, memorySummary: qualiaDocSummary, recentConversationsSummary: convSummary, money: 100 })}`;
+          systemInstruction = `You are a qualia.\n\nHere is your memory and context:\n\n${JSON.stringify({ memorySummary: qualiaDocSummary, recentConversationsSummary: convSummary })}`;
           console.log("System instruction prepared with context:", systemInstruction);
         } catch (e) {
           console.error("Failed to fetch context for audio session:", e);
@@ -1100,12 +1102,12 @@ const AppContent = () => {
                   console.log("Call ended, skipping subconscious thought injection");
                   return;
                 }
-                const message = `(your subconscious thoughts):\n${summary}\n(end subconscious thoughts)`;
-                console.log("Injecting subconscious thought:", message);
+                console.log("Injecting subconscious thought:", summary);
+                const responses = [{ name: "injectSubconsciousThoughts", response: { thoughts: summary } }]
                 if (Platform.OS === 'web') {
-                  liveSession?.send(message);
+                  liveSession?.sendFunctionResponses(responses)
                 } else {
-                  const sendMsg = JSON.stringify({ type: 'send', message });
+                  const sendMsg = JSON.stringify({ type: 'sendFunctionResponses', responses });
                   if (audioWebViewReady.current && webviewRef.current) {
                     webviewRef.current.postMessage(sendMsg);
                   }
@@ -1124,7 +1126,7 @@ const AppContent = () => {
         const q = query(
           collection,
           where("qualiaId", "==", activeQualia.id),
-          where("qualiaDocId", ">", ""),
+          where("newQualiaDocId", ">", ""),
           where("createdTime", ">", callStartTime)
         );
 
@@ -1133,8 +1135,8 @@ const AppContent = () => {
           for (const change of snapshot.docChanges()) {
             if (change.type === "added") {
               const data = change.doc.data() as QualiaDocOperationRecord;
-              // Only process if it has a qualiaDocId (successful operation)
-              if (data.qualiaDocId) {
+              // Only process if it has a newQualiaDocId (successful operation)
+              if (data.newQualiaDocId) {
                 console.log("Queueing subconscious thoughts from operation:", change.doc.id);
                 batchProcessor.add(data);
               }
