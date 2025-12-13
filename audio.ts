@@ -6,9 +6,6 @@ import {
 } from "firebase/auth";
 import {
     getAI,
-    getLiveGenerativeModel,
-    startAudioConversation,
-    GoogleAIBackend,
     AI,
     LiveSession,
 } from "firebase/ai";
@@ -22,14 +19,11 @@ const log = (message: any) => post({ type: "log", message });
 
 // Early readiness ping so the host knows we loaded, even if init fails.
 post({ type: "ready" });
-log("HAHAHAH");
 let auth: Auth;
 let ai: AI;
 
 let app = initializeApp(firebaseConfig);
 console.log("app init")
-const back = new GoogleAIBackend();
-console.log("back init")
 try {
     auth = getAuth(app);
     ai = getAI(app);
@@ -74,7 +68,7 @@ async function ensureSignedIn(idToken: string) {
 
 let liveSession: LiveSession;
 
-import { AUDIO_GENERATION_CONFIG, processStreamMessages, connectAndStartAudioSession } from "./audioShared";
+import { setupAudioSession } from "./audioShared";
 
 // ...
 
@@ -86,7 +80,13 @@ async function startAudioConversationWithInstruction(
     try {
         await ensureSignedIn(idToken);
         log("Signed in, starting audio session");
-        liveSession = await connectAndStartAudioSession(ai, systemInstruction);
+        liveSession = await setupAudioSession(ai, {
+            onUserPart: (text) => post({ type: "user-part", message: text }),
+            onModelPart: (text) => post({ type: "gemini-part", message: text }),
+            onUserFlush: (text) => post({ type: "user", message: text }),
+            onModelFlush: (text) => post({ type: "gemini", message: text }),
+            onEnded: () => post({ type: "ended", message: "" }),
+        }, systemInstruction);
     } catch (error: any) {
         log(`Failed to start audio session: ${error?.message || error}\n${error.stack} `);
         post({
@@ -97,24 +97,6 @@ async function startAudioConversationWithInstruction(
     }
 
     log("Started audio conversation");
-    liveSession.send("(call started)");
-    receiveMessages(liveSession);
-}
-
-async function receiveMessages(session: LiveSession) {
-    const postMessage = (type: any, message: any) => {
-        (window as any).ReactNativeWebView?.postMessage(
-            JSON.stringify({ type, message }),
-        );
-    };
-
-    await processStreamMessages(session, {
-        onUserPart: (text) => postMessage("user-part", text),
-        onModelPart: (text) => postMessage("gemini-part", text),
-        onUserFlush: (text) => postMessage("user", text),
-        onModelFlush: (text) => postMessage("gemini", text),
-        onEnded: () => postMessage("ended", ""),
-    });
 }
 
 

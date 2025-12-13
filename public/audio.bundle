@@ -9541,18 +9541,25 @@
     await startAudioConversation(session);
     return session;
   }
+  async function setupAudioSession(ai2, callbacks, systemInstruction, initialMessage = "(call started)") {
+    const session = await connectAndStartAudioSession(ai2, systemInstruction);
+    if (initialMessage) {
+      session.send(initialMessage);
+    }
+    processStreamMessages(session, callbacks).catch((err) => {
+      console.error("Error in processStreamMessages:", err);
+    });
+    return session;
+  }
 
   // audio.ts
   var post = (payload) => window.ReactNativeWebView.postMessage(JSON.stringify(payload));
   var log = (message) => post({ type: "log", message });
   post({ type: "ready" });
-  log("HAHAHAH");
   var auth;
   var ai;
   var app = initializeApp(firebaseConfig);
   console.log("app init");
-  var back = new GoogleAIBackend();
-  console.log("back init");
   try {
     auth = getAuth(app);
     ai = getAI(app);
@@ -9598,7 +9605,13 @@
     try {
       await ensureSignedIn(idToken);
       log("Signed in, starting audio session");
-      liveSession = await connectAndStartAudioSession(ai, systemInstruction);
+      liveSession = await setupAudioSession(ai, {
+        onUserPart: (text) => post({ type: "user-part", message: text }),
+        onModelPart: (text) => post({ type: "gemini-part", message: text }),
+        onUserFlush: (text) => post({ type: "user", message: text }),
+        onModelFlush: (text) => post({ type: "gemini", message: text }),
+        onEnded: () => post({ type: "ended", message: "" })
+      }, systemInstruction);
     } catch (error) {
       log(`Failed to start audio session: ${error?.message || error}
 ${error.stack} `);
@@ -9609,22 +9622,6 @@ ${error.stack} `);
       throw error;
     }
     log("Started audio conversation");
-    liveSession.send("(call started)");
-    receiveMessages(liveSession);
-  }
-  async function receiveMessages(session) {
-    const postMessage = (type, message) => {
-      window.ReactNativeWebView?.postMessage(
-        JSON.stringify({ type, message })
-      );
-    };
-    await processStreamMessages(session, {
-      onUserPart: (text) => postMessage("user-part", text),
-      onModelPart: (text) => postMessage("gemini-part", text),
-      onUserFlush: (text) => postMessage("user", text),
-      onModelFlush: (text) => postMessage("gemini", text),
-      onEnded: () => postMessage("ended", "")
-    });
   }
   var handleMessage = (event) => {
     try {

@@ -108,3 +108,23 @@ export async function connectAndStartAudioSession(
     await startAudioConversation(session);
     return session;
 }
+
+export async function setupAudioSession(
+    ai: AI,
+    callbacks: AudioCallbacks,
+    systemInstruction?: string,
+    initialMessage: string = "(call started)"
+): Promise<LiveSession> {
+    const session = await connectAndStartAudioSession(ai, systemInstruction);
+
+    if (initialMessage) {
+        session.send(initialMessage);
+    }
+
+    // Start processing messages without awaiting it to block
+    processStreamMessages(session, callbacks).catch(err => {
+        console.error("Error in processStreamMessages:", err);
+    });
+
+    return session;
+}
