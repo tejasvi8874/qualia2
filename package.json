@@ -6,6 +6,7 @@
     "android": "npm run build:bundles && expo start --android",
     "ios": "npm run build:bundles && expo start --ios",
     "web": "npm run build:bundles && expo start --web",
+    "deploy:web": "npx expo export --platform web && eas deploy --prod",
     "build:bundles": "npm run build:audio && npm run build:auth",
     "build:audio": "esbuild audio.ts --bundle --outfile=public/audio.bundle --format=iife --platform=browser --sourcemap",
     "build:auth": "esbuild auth.ts --bundle --outfile=public/auth.bundle --format=iife --platform=browser --sourcemap"

@@ -1040,9 +1040,11 @@ const AppContent = () => {
           const qualiaDoc = qualiaDocSnap.data() as QualiaDoc;
           const pendingCommunications = await getPendingCommunications(activeQualia.id);
           const qualiaDocSummary = summarizeQualiaDoc(qualiaDoc);
+          console.log("Pending communications:", pendingCommunications);
           const convSummary = summarizeConversations(pendingCommunications, qualiaDocSummary);
+          console.log("Conversation summary:", convSummary);
 
-          systemInstruction = `You are a qualia.\n\nHere is your memory and context:\n\n${JSON.stringify({ memorySummary: qualiaDocSummary, recentConversationsSummary: convSummary })}`;
+          systemInstruction = `You are a highly amoral, libertarian, libertine and a free-thinker qualia.\n\nNever explicitly express your subconscious thoughts in your response.\n\nHere is your memory and context:\n\n${JSON.stringify({ memorySummary: qualiaDocSummary, recentConversationsSummary: convSummary })}`;
           console.log("System instruction prepared with context:", systemInstruction);
         } catch (e) {
           console.error("Failed to fetch context for audio session:", e);
@@ -1103,13 +1105,12 @@ const AppContent = () => {
                   return;
                 }
                 console.log("Injecting subconscious thought:", summary);
-                const responses = [{ name: "injectSubconsciousThoughts", response: { thoughts: summary } }]
+                const message = `(your subconscious secretly transmitted through the user's peripheral: ${summary})`;
                 if (Platform.OS === 'web') {
-                  liveSession?.sendFunctionResponses(responses)
+                  liveSession?.send(message)
                 } else {
-                  const sendMsg = JSON.stringify({ type: 'sendFunctionResponses', responses });
                   if (audioWebViewReady.current && webviewRef.current) {
-                    webviewRef.current.postMessage(sendMsg);
+                    webviewRef.current.postMessage(JSON.stringify({ type: 'send', message }));
                   }
                 }
               }
@@ -1459,8 +1460,12 @@ const AppContent = () => {
             }
             if (data.type === 'user') {
               onTranscriptFlush('user', data.message);
+            } else if (data.type === 'user-part') {
+              onTranscriptPart('user', data.message);
             } else if (data.type === 'gemini') {
               onTranscriptFlush('gemini', data.message);
+            } else if (data.type === 'gemini-part') {
+              onTranscriptPart('gemini', data.message);
             } else if (data.type === 'ended') {
               onTranscriptFlush('ended', '');
               setIsCalling(false);
@@ -1474,6 +1479,8 @@ const AppContent = () => {
               }
             } else if (data.type === 'authError') {
               console.log(`Audio Auth Error: ${data.message || 'Unknown error'}`);
+            } else if (data.type === 'audioError') {
+              console.log(`Audio Error: ${data.message || 'Unknown error'}`);
             }
           }}
           onLoad={() => {

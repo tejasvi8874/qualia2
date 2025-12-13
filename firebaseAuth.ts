@@ -13,16 +13,16 @@ import { getInstallations } from "firebase/installations";
 import { initializeApp } from "firebase/app";
 import { firebaseConfig } from "./firebaseConfig";
 import Constants from "expo-constants";
-import { isWeb } from "./platformUtils";
+import { Platform } from "react-native";
 
 const app = initializeApp(firebaseConfig);
 initializeFirestore(app, {
-    localCache: isWeb()
+    localCache: Platform.OS === "web"
         ? persistentLocalCache({ tabManager: persistentMultipleTabManager() })
         : persistentLocalCache()
 });
 console.log({ Constants, p: Constants.platform, w: Constants.platform?.web });
-initializeAuth(app, { persistence: isWeb() ? browserLocalPersistence : getReactNativePersistence() });
+initializeAuth(app, { persistence: Platform.OS === "web" ? browserLocalPersistence : getReactNativePersistence() });
 export const auth = getAuth(app);
 auth.useDeviceLanguage();
 

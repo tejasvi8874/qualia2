@@ -1,4 +1,4 @@
-import { LiveModelParams, LiveSession, ResponseModality } from "firebase/ai";
+import { FunctionCallingMode, LiveModelParams, LiveSession, ResponseModality } from "firebase/ai";
 
 export const AUDIO_GENERATION_CONFIG: LiveModelParams = {
     model: "gemini-live-2.5-flash-preview",

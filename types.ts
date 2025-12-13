@@ -184,6 +184,9 @@ export interface Qualia {
   qualiaId: string;
   money: number;
   phoneNumber?: string;
+  currentQualiaDocId?: string;
+  processingBefore?: Timestamp;
+  lockOwner?: string;
 }
 
 // Uses a unified 'onAction' prop to handle switching and creation

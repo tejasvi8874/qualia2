@@ -119,10 +119,10 @@ const handleMessage = (event: any) => {
                 if (liveSession) {
                     liveSession.close();
                 }
-            case "sendFunctionResponses":
+            case "send":
                 if (liveSession) {
                     log(`Sending message to audio session: ${data.message}`);
-                    liveSession.sendFunctionResponses(data.message);
+                    liveSession.send(data.message);
                 }
             default:
                 throw new Error(`Unknown message type: ${data.type}`);

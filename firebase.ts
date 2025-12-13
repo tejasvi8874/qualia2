@@ -311,15 +311,17 @@ export async function runWithLock<T>(
 let cachedLockOwnerId: string | null = null;
 async function getLockOwnerId(): Promise<string> {
   if (cachedLockOwnerId) return cachedLockOwnerId;
-  try {
-    cachedLockOwnerId = await getId(installations);
-  } catch (e) {
-    // Fallback for Node.js environment where indexedDB is not available
-    console.log("Failed to get installation ID, using fallback:", e);
-    if (!cachedLockOwnerId) {
-      cachedLockOwnerId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-    }
-  }
+  // always fallback to random id because refresh etc destroys existing operations. Peristent id is not needed for locks
+  cachedLockOwnerId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  // try {
+  //   cachedLockOwnerId = await getId(installations);
+  // } catch (e) {
+  //   // Fallback for Node.js environment where indexedDB is not available
+  //   console.log("Failed to get installation ID, using fallback:", e);
+  //   if (!cachedLockOwnerId) {
+  //     cachedLockOwnerId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+  //   }
+  // }
   console.log("Lock owner ID:", cachedLockOwnerId);
   return cachedLockOwnerId!;
 }
