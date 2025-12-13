@@ -20,14 +20,14 @@ import {
 // Import SafeAreaProvider to use in the root and within the Modal
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
-import { sendMessage, registerClientMessageClb, getContacts, updateContacts, getHistoricalMessages } from "./firebaseClientUtils";
+import { sendMessage, registerClientMessageClb, getContacts, getHistoricalMessages } from "./firebaseClientUtils";
 import { Communication, ContextQualia, QualiaDoc } from "./types";
 import { Timestamp, getDoc, addDoc, writeBatch, doc } from "firebase/firestore";
-import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef } from "./server";
+import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef, updateContacts } from "./server";
 import { serializeQualia } from "./graphUtils";
 import { auth, db } from "./firebaseAuth";
 import { communicationsCollection } from "./firebase";
-import { RecaptchaVerifier } from "firebase/auth";
+import { RecaptchaVerifier, signInWithPhoneNumber, ConfirmationResult, PhoneAuthProvider, signInWithCredential } from "firebase/auth";
 import { firebaseConfig } from "./firebaseConfig";
 import { startAudioSession } from "./audioSession";
 import { LiveSession } from "firebase/ai";
@@ -358,13 +358,93 @@ const AppContent = () => {
   const [userId, setUserId] = useState<string | null>(null);
   const [isCalling, setIsCalling] = useState(false);
   const webviewRef = useRef<WebView>(null);
+  const authWebViewRef = useRef<WebView>(null);
+  const authWebViewReady = useRef(false);
+  const pendingAuthCommand = useRef<string | null>(null);
   const [liveSession, setLiveSession] = useState<LiveSession | null>(null);
   const [graphError, setGraphError] = useState<string | null>(null);
+  const [confirmationResult, setConfirmationResult] = useState<ConfirmationResult | null>(null);
+  const [verificationId, setVerificationId] = useState<string | null>(null);
+  const [inputText, setInputText] = useState("");
+
+  const postToAuthWebView = useCallback((payload: object) => {
+    const message = JSON.stringify(payload);
+    if (authWebViewReady.current && authWebViewRef.current) {
+      authWebViewRef.current.postMessage(message);
+      return true;
+    }
+    pendingAuthCommand.current = message;
+    setGraphError("Auth component is still loading. Retrying...");
+    return false;
+  }, []);
+
+  const handleAuthSubmit = useCallback(async () => {
+    // Native: trigger WebView-based reCAPTCHA & phone auth
+    if (Platform.OS !== "web") {
+      if (!inputText.trim()) return;
+
+      // Step 1: ask WebView to send SMS with reCAPTCHA solved inside it
+      if (!verificationId) {
+        postToAuthWebView({ type: "startPhoneAuth", phoneNumber: inputText.trim() });
+        setInputText("");
+        return;
+      }
+
+      // Step 2: confirm code natively using the verificationId from the WebView
+      try {
+        const credential = PhoneAuthProvider.credential(
+          verificationId,
+          inputText.trim(),
+        );
+        await signInWithCredential(auth, credential);
+        setVerificationId(null);
+        setInputText("");
+      } catch (error: any) {
+        console.error("OTP Error:", error);
+        alert("Invalid verification code: " + (error?.message || ""));
+      }
+      return;
+    }
+
+    if (!inputText.trim()) return;
+
+    if (!confirmationResult) {
+      // Phone Number Step (web with reCAPTCHA)
+      try {
+        const appVerifier = new RecaptchaVerifier(auth, 'sign-in-button', {
+          'size': 'invisible',
+          'callback': (response: any) => {
+            // reCAPTCHA solved, allow signInWithPhoneNumber.
+          }
+        });
+
+        const result = await signInWithPhoneNumber(auth, inputText, appVerifier);
+        setConfirmationResult(result);
+        setInputText("");
+      } catch (error: any) {
+        console.error("Phone Auth Error:", error);
+        alert("Error sending code: " + error.message);
+      }
+    } else {
+      // OTP Step
+      try {
+        await confirmationResult.confirm(inputText);
+        // User signed in. Auth listener will handle the rest.
+        setConfirmationResult(null);
+        setInputText("");
+      } catch (error) {
+        console.error("OTP Error:", error);
+        alert("Invalid verification code");
+      }
+    }
+  }, [inputText, confirmationResult, verificationId, postToAuthWebView]);
 
   useEffect(() => {
     const unsubscribe = auth.onAuthStateChanged((user) => {
       if (user) {
         setUserId(user.uid);
+        setVerificationId(null);
+        setConfirmationResult(null);
       } else {
         setUserId(null);
         // Reset state on sign out
@@ -373,6 +453,7 @@ const AppContent = () => {
         setMessages([]);
         setContacts([]);
         setGraphError(null);
+        setVerificationId(null);
       }
     });
     return () => unsubscribe();
@@ -424,7 +505,6 @@ const AppContent = () => {
   const [isThinkingMode, setIsThinkingMode] = useState(false); // False = Speaking
 
   const [messages, setMessages] = useState<Message[]>([]);
-  const [inputText, setInputText] = useState("");
   const [isSwitcherVisible, setIsSwitcherVisible] = useState(false);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
@@ -608,6 +688,11 @@ const AppContent = () => {
   );
 
   const handleInputChange = (text: string) => {
+    if (!userId) {
+      setInputText(text);
+      return;
+    }
+
     // Enter key toggles mode only if user is established AND not talking to self
     if (text.endsWith("\n") && userQualia && !isTalkingToSelf) {
       toggleMode();
@@ -1009,13 +1094,42 @@ const AppContent = () => {
             style={[styles.input, { color: theme.text }]}
             value={inputText}
             onChangeText={handleInputChange}
-            placeholder="..."
+            placeholder={
+              !userId
+                ? (Platform.OS === "web"
+                  ? (!confirmationResult ? "Enter Phone Number (+1...)" : "Enter Code")
+                  : (!verificationId ? "Enter Phone Number (+1...)" : "Enter Code"))
+                : "..."
+            }
             placeholderTextColor={theme.dimText}
-            multiline
+            multiline={!!userId}
             autoFocus={true}
             selectionColor={theme.accent}
             underlineColorAndroid="transparent"
-            submitBehavior="newline"
+            submitBehavior={userId ? "newline" : "submit"}
+            keyboardType={
+              !userId
+                ? ((Platform.OS === "web"
+                  ? (!confirmationResult ? "phone-pad" : "number-pad")
+                  : (!verificationId ? "phone-pad" : "number-pad")))
+                : "default"
+            }
+            textContentType={
+              !userId
+                ? ((Platform.OS === "web"
+                  ? (!confirmationResult ? "telephoneNumber" : "oneTimeCode")
+                  : (!verificationId ? "telephoneNumber" : "oneTimeCode")))
+                : "none"
+            }
+            autoComplete={
+              !userId
+                ? ((Platform.OS === "web"
+                  ? (!confirmationResult ? "tel" : "sms-otp")
+                  : (!verificationId ? "tel" : "sms-otp")))
+                : undefined
+            }
+            returnKeyType={!userId ? "done" : "default"}
+            onSubmitEditing={!userId ? handleAuthSubmit : undefined}
           />
           {/* Requirement: Don't show thinking/speaking toggle when talking to own qualia. 
               Also hide until userQualia is established. */}
@@ -1046,12 +1160,55 @@ const AppContent = () => {
         onSignOut={handleSignOut}
       />
       <View nativeID="sign-in-button" />
+      {Platform.OS !== 'web' && (
+        <WebView
+          ref={authWebViewRef}
+          style={{ position: 'absolute', width: 1, height: 1, opacity: 0, top: 0, left: 0 }}
+          source={require('./public/webview/auth.html')}
+          injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
+          onMessage={(event) => {
+            try {
+              const raw = event.nativeEvent.data;
+              const data = typeof raw === "string"
+                ? (() => { try { return JSON.parse(raw); } catch { return { type: "raw", message: raw }; } })()
+                : raw;
+              if (data.type === 'verificationId') {
+                setVerificationId(data.verificationId || null);
+                setGraphError(null);
+              } else if (data.type === 'authError') {
+                setGraphError(`Auth Error: ${data.message || 'Unknown error'}`);
+              } else if (data.type === 'log') {
+                console.log("Auth WebView:", data.message);
+              } else if (data.type === 'raw') {
+                console.log("Auth WebView raw:", data.message);
+              } else if (data.type === 'ready') {
+                authWebViewReady.current = true;
+                setGraphError(null);
+                if (pendingAuthCommand.current && authWebViewRef.current) {
+                  authWebViewRef.current.postMessage(pendingAuthCommand.current);
+                  pendingAuthCommand.current = null;
+                }
+              }
+            } catch (e) {
+              console.error("Auth WebView parse error", e);
+            }
+          }}
+          onLoad={() => {
+            authWebViewReady.current = true;
+            if (pendingAuthCommand.current && authWebViewRef.current) {
+              authWebViewRef.current.postMessage(pendingAuthCommand.current);
+              pendingAuthCommand.current = null;
+            }
+          }}
+          originWhitelist={["*"]}
+        />
+      )}
       {Platform.OS !== 'web' && userQualia && (
         <WebView
           ref={webviewRef}
-          style={{ display: 'none' }}
+          style={{ position: 'absolute', width: 1, height: 1, opacity: 0, top: 0, left: 0 }}
           source={require('./public/webview/audio.html')}
-          injectedJavaScript={`const firebaseConfig = ${JSON.stringify(firebaseConfig)};`}
+          injectedJavaScriptBeforeContentLoaded={`window.firebaseConfig = ${JSON.stringify(firebaseConfig)}; true;`}
           onMessage={(event) => {
             const data = JSON.parse(event.nativeEvent.data);
             if (data.type === 'user') {

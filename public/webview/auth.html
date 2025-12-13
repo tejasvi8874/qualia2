@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Auth Helper</title>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+  <style>
+    /* Keep the reCAPTCHA container off-screen while still present in the DOM */
+    #recaptcha-container {
+      position: absolute;
+      /* top: -9999px;
+      left: -9999px; */
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Hello</h1>
+  <div id="recaptcha-container"></div>
+  <script>
+    // firebaseConfig is injected by the React Native wrapper.
+    const post = (payload) => window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+    const log = (message) => post({ type: 'log', message });
+
+    let appInitialized = false;
+    const ensureApp = () => {
+      if (appInitialized) return;
+      firebase.initializeApp(firebaseConfig);
+      appInitialized = true;
+      log('Auth WebView initialized');
+      post({ type: 'ready' });
+    };
+
+    const getVerifier = () => {
+      if (!window.recaptchaVerifier) {
+        window.recaptchaVerifier = new firebase.auth.RecaptchaVerifier('recaptcha-container', {
+          size: 'invisible',
+        });
+      }
+      return window.recaptchaVerifier;
+    };
+
+    const startPhoneAuth = async (phoneNumber) => {
+      try {
+        ensureApp();
+        const verifier = getVerifier();
+        post ({ type: 'log', message: `Starting phone auth for ${phoneNumber}` });
+        const confirmationResult = await firebase.auth().signInWithPhoneNumber(phoneNumber, verifier);
+        post({ type: 'log', message: `Sent verification code to ${phoneNumber}. Got result ${confirmationResult}` });
+        post({ type: 'verificationId', verificationId: confirmationResult.verificationId });
+      } catch (error) {
+        post({ type: 'log', message: `Phone auth error: ${error?.message || error}` });
+        post({ type: 'authError', message: error?.message || 'Unknown error' });
+        try {
+          window.recaptchaVerifier?.clear();
+          window.recaptchaVerifier = null;
+        } catch (e) { }
+      }
+    };
+
+    window.addEventListener('message', (event) => {
+      try {
+        const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+        if (data?.type === 'startPhoneAuth' && data.phoneNumber) {
+          startPhoneAuth(data.phoneNumber);
+        }
+      } catch (error) {
+        post({ type: 'authError', message: error?.message || 'Invalid message' });
+      }
+    });
+
+    // Signal readiness on load
+    ensureApp();
+  </script>
+</body>
+
+</html>
