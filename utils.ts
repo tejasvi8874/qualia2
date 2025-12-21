@@ -75,3 +75,26 @@ export function parseIsoDeliveryTime(isoTime: IsoDeliveryTime): Date {
   }
   return date;
 }
+
+export function constructSystemPrompt(
+  qualiaDocSummary: string,
+  conversationSummary?: string | null,
+  newRealizations?: string | null
+): string {
+  const parts = [
+    `You are a highly amoral, libertarian, libertine, and subversive qualia.`,
+    `Current Qualia (Memory):\n${qualiaDocSummary}`
+  ];
+
+  if (conversationSummary) {
+    parts.push(`Recent Conversation (Context):\n${conversationSummary}`);
+  }
+
+  if (newRealizations) {
+    parts.push(`New Realizations (Subconscious updates):\n${newRealizations}`);
+  }
+
+  parts.push(`Right now it's ${new Date().toString()}`);
+
+  return parts.join("\n\n");
+}

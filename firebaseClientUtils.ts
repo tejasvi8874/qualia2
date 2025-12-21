@@ -27,7 +27,7 @@ export async function sendMessage({ message, contextQualia, toQualia }: { messag
 }
 
 export async function registerClientMessageClb(callback: (communication: Communication) => Promise<void>) {
-  return getMessageListener(await getUserId(), await communicationsCollection(), or(where("fromQualiaId", "!=", await getUserId()), where("communicationType", "==", "QUALIA_TO_HUMAN")), callback, false, "seen");
+  return getMessageListener(await getUserId(), await communicationsCollection(), or(where("fromQualiaId", "!=", await getUserId()), where("communicationType", "==", "QUALIA_TO_HUMAN")), callback, false, "seen", (comm) => comm.communicationType === "QUALIA_TO_HUMAN");
 }
 
 export async function getContacts(): Promise<Contact[]> {

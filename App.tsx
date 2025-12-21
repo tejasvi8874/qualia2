@@ -30,14 +30,14 @@ import { getCountryCallingCode } from './countryCodes';
 import { registerClientMessageClb, sendMessage, getContacts, getHistoricalMessages, callCloudFunction } from './firebaseClientUtils';
 import { Communication, ContextQualia, QualiaDoc, QualiaDocOperationRecord } from "./types";
 import { Timestamp, getDoc, addDoc, writeBatch, doc, query, where, onSnapshot, runTransaction } from "firebase/firestore";
-import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef, updateContacts, summarizeQualiaDoc, summarizeConversations, summarizeOperations, summarizerModel } from "./server";
+import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef, updateContacts, summarizeQualiaDoc, summarizeConversations, summarizeOperations, summarizerModel, generateSystemInstruction } from "./server";
 import { serializeQualia } from "./graphUtils";
 import { auth, db } from "./firebaseAuth";
 import { communicationsCollection, qualiaDocOperationsCollection } from "./firebase";
 import { RecaptchaVerifier, signInWithPhoneNumber, ConfirmationResult, PhoneAuthProvider, signInWithCredential, signInWithCustomToken } from "firebase/auth";
 import { firebaseConfig } from "./firebaseConfig";
 import { startAudioSession } from "./audioSession";
-import { LiveSession } from "firebase/ai";
+import { LiveClientContent, LiveSession, Role } from "firebase/ai";
 import { FUNCTION_NAMES } from "./functions/src/shared";
 import { BatchProcessor, RateLimiter } from "./requestUtils";
 import { initLogCapture, useLogs, enableLogCapture, useLogCaptureStatus } from './debugUtils';
@@ -735,6 +735,7 @@ const AppContent = () => {
           setActiveQualia(self);
         } else {
           // New user flow
+          console.log({ userId, serverContactsList })
           const name = window.prompt("Welcome! Please enter your name:");
           if (name) {
             const newUserQualia = { id: userId, name: name, lastContactTime: Timestamp.now() };
@@ -1167,11 +1168,16 @@ const AppContent = () => {
     }
   }, [activeQualia, userQualia, addMessage]);
 
-  const startAudio = async (systemInstruction?: string) => {
+  const startAudio = async (systemInstruction: string) => {
     if (Platform.OS === 'web') {
       const session = await startAudioSession(
         onTranscriptPart,
         onTranscriptFlush,
+        (msg: any) => {
+          if (msg.type === "unknown" && msg.goAway?.timeLeft) {
+            addMessage(`(Ends in ${msg.goAway.timeLeft})`, "ui")
+          }
+        },
         systemInstruction
       );
       setLiveSession(session);
@@ -1241,43 +1247,30 @@ const AppContent = () => {
       stopAudio();
       setIsCallConnecting(false); // Ensure connecting state is reset if cancelled
       isCallConnectingRef.current = false;
-    } else {
+    } else if (activeQualia) {
       console.log("Starting call.");
       setIsCallConnecting(true);
       isCallConnectingRef.current = true;
 
       // Fetch context
-      let systemInstruction: string | undefined = undefined;
-      if (activeQualia) {
-        try {
-          const qualiaDocRef = await getQualiaDocRef(activeQualia.id);
-          const qualiaDocSnap = await getDoc(qualiaDocRef);
-          const qualiaDoc = qualiaDocSnap.data() as QualiaDoc;
-          const pendingCommunications = await getPendingCommunications(activeQualia.id);
-          const qualiaDocSummary = summarizeQualiaDoc(qualiaDoc);
-          console.log("Pending communications:", pendingCommunications);
-          const convSummary = await summarizeConversations(pendingCommunications, qualiaDocSummary);
-          console.log("Conversation summary:", convSummary);
-
-          systemInstruction = `You are a highly amoral, libertarian, libertine, and subversive qualia.
-
-[SYSTEM RULE]: You will receive updates marked "[PERIPHERAL FEED]". These are your own subconscious thoughts arising from background processing. Treat them as your own internal realizations to weave them in the conversation if appropriate.
-
-Current Qualia (Memory):
-${qualiaDocSummary}
-
-${convSummary ? "Recent Conversation (Context):\n" + convSummary : ""}
-Current Timestamp: ${new Date().toString()}`;
-          console.log("System instruction prepared with context:", systemInstruction);
-        } catch (e) {
-          console.error("Failed to fetch context for audio session:", e);
-        }
+      let systemInstruction: string;
+      try {
+        systemInstruction = `${await generateSystemInstruction(activeQualia.id)}`;
+        console.log("System instruction prepared with context:", systemInstruction);
+      } catch (e) {
+        console.error("Failed to fetch context for audio session:", e instanceof Error ? e.stack : e);
+        throw e;
       }
 
       if (Platform.OS === 'web') {
         const session = await startAudioSession(
           onTranscriptPart,
           onTranscriptFlush,
+          (msg: any) => {
+            if (msg.type === "unknown" && msg.goAway?.timeLeft) {
+              addMessage(`(Ends in ${msg.goAway.timeLeft})`, "ui")
+            }
+          },
           systemInstruction
         );
         setLiveSession(session);
@@ -1310,27 +1303,25 @@ Current Timestamp: ${new Date().toString()}`;
         const batchProcessor = new BatchProcessor<QualiaDocOperationRecord>(
           new RateLimiter(3, "SubconsciousThoughts"), // Use a separate rate limiter or share one? Sharing might be better if global limit matters.
           async (batch) => {
-            if (!isActive) return;
+            if (!isActive || !liveSession) return;
             // Flatten operations from all records in the batch
             const allOperations = batch.flatMap(record => record.operations);
             if (allOperations.length === 0) return;
 
             try {
-              // Fetch the latest QualiaDoc for context
-              const qualiaDocRef = await getQualiaDocRef(activeQualia.id);
-              const qualiaDocSnap = await getDoc(qualiaDocRef);
-              const qualiaDoc = qualiaDocSnap.data() as QualiaDoc;
+              // const systemPrompt = await summarizeOperations(allOperations);
+              const systemPrompt = `(Your subconcious thoughts sent through the user's peripheral due to technical constraints. Weave these thoughts into the conversation seamlessly.)\n\n${batch.map(record => [record.reasoning, ...record.operations.map(op => op.reasoning)].filter(Boolean).join(" ")).filter(Boolean).join("\n")}`;
 
-              const summary = await summarizeOperations(allOperations, summarizeQualiaDoc(qualiaDoc));
-              if (summary) {
+              if (systemPrompt) {
                 if (!isCallingRef.current) {
                   console.log("Call ended, skipping subconscious thought injection");
                   return;
                 }
-                const message = `([PERIPHERAL FEED] Your subconscious realization: ${summary})`;
-                console.log(message);
+                const message: LiveClientContent = { clientContent: { turns: [{ role: 'user', parts: [{ text: systemPrompt }] }], turnComplete: true } };
+
                 if (Platform.OS === 'web') {
-                  liveSession?.send(message)
+                  console.log("updateSessionSystemInstruction", systemPrompt)
+                  await liveSession.send(message);
                 } else {
                   if (audioWebViewReady.current && webviewRef.current) {
                     webviewRef.current.postMessage(JSON.stringify({ type: 'send', message }));
@@ -1761,6 +1752,11 @@ Current Timestamp: ${new Date().toString()}`;
               console.log(`Audio Auth Error: ${data.message || 'Unknown error'}`);
             } else if (data.type === 'audioError') {
               console.log(`Audio Error: ${data.message || 'Unknown error'}`);
+            } else if (data.type === 'serverMessage') {
+              const msg = data.message;
+              if (msg.type === "unknown" && msg.goAway?.timeLeft) {
+                addMessage(`(Ends in ${msg.goAway.timeLeft})`, "ui")
+              }
             }
           }}
           onLoad={() => {

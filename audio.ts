@@ -8,6 +8,7 @@ import {
     getAI,
     AI,
     LiveSession,
+    VertexAIBackend,
 } from "firebase/ai";
 import { firebaseConfig } from "./firebaseConfig";
 // This script is self-contained and runs inside the native WebView.
@@ -26,7 +27,7 @@ let app = initializeApp(firebaseConfig);
 console.log("app init")
 try {
     auth = getAuth(app);
-    ai = getAI(app);
+    ai = getAI(app, { backend: new VertexAIBackend("us-central1") })
     log("Audio WebView initialized");
 } catch (err: any) {
     log("Audio WebView init failed: " + JSON.stringify(err.stack));
@@ -86,6 +87,7 @@ async function startAudioConversationWithInstruction(
             onUserFlush: (text) => post({ type: "user", message: text }),
             onModelFlush: (text) => post({ type: "gemini", message: text }),
             onEnded: () => post({ type: "ended", message: "" }),
+            onUnknownMessage: (msg) => post({ type: "serverMessage", message: msg }),
         }, systemInstruction);
     } catch (error: any) {
         log(`Failed to start audio session: ${error?.message || error}\n${error.stack} `);

@@ -8078,7 +8078,8 @@
   var LiveResponseType = {
     SERVER_CONTENT: "serverContent",
     TOOL_CALL: "toolCall",
-    TOOL_CALL_CANCELLATION: "toolCallCancellation"
+    TOOL_CALL_CANCELLATION: "toolCallCancellation",
+    UNKNOWN: "unknown"
   };
   var AIErrorCode = {
     /** A generic error occurred. */
@@ -8721,8 +8722,10 @@
               ...message.toolCallCancellation
             };
           } else {
-            parsedMessage = message;
-            logger2.warn(`Received an unknown message type from the server: ${JSON.stringify(message)}`);
+            parsedMessage = {
+              type: "unknown",
+              ...message
+            };
           }
         } else {
           logger2.warn(`Received an invalid message from the server: ${JSON.stringify(message)}`);
@@ -8774,19 +8777,18 @@
       if (this.isClosed) {
         throw new AIError(AIErrorCode.REQUEST_ERROR, "This LiveSession has been closed and cannot be used.");
       }
-      let newContent;
-      if (typeof request === "object" && "role" in request && "parts" in request) {
-        newContent = request;
+      if (typeof request === "string" || Array.isArray(request)) {
+        const newContent = formatNewContent(request);
+        const message = {
+          clientContent: {
+            turns: [newContent],
+            turnComplete
+          }
+        };
+        this.webSocketHandler.send(JSON.stringify(message));
       } else {
-        newContent = formatNewContent(request);
+        this.webSocketHandler.send(JSON.stringify(request));
       }
-      const message = {
-        clientContent: {
-          turns: [newContent],
-          turnComplete
-        }
-      };
-      this.webSocketHandler.send(JSON.stringify(message));
     }
     /**
      * Sends text to the server in realtime.
@@ -8922,6 +8924,20 @@
     /**
      * @internal
      */
+    dispatchSignal(signal) {
+      if (this.isClosed) {
+        return;
+      }
+      if (this.clientMessageResolver) {
+        this.clientMessageResolver({ value: signal, done: false });
+        this.clientMessageResolver = void 0;
+      } else {
+        this.clientMessageQueue.push({ value: signal, done: false });
+      }
+    }
+    /**
+     * @internal
+     */
     async *internalReceive() {
       while (true) {
         if (this.internalMessageQueue.length > 0) {
@@ -9018,16 +9034,12 @@
       this.systemInstruction = formatSystemInstruction(modelParams.systemInstruction);
     }
     /**
-     * Starts a {@link LiveSession}.
+     * Creates a setup message for the Live session.
      *
-     * @returns A {@link LiveSession}.
-     * @throws If the connection failed to be established with the server.
-     *
+     * @returns The setup message.
      * @beta
      */
-    async connect() {
-      const url = new WebSocketUrl(this._apiSettings);
-      await this._webSocketHandler.connect(url.toString());
+    createSetupMessage() {
       let fullModelPath;
       if (this._apiSettings.backend.backendType === BackendType.GOOGLE_AI) {
         fullModelPath = `projects/${this._apiSettings.project}/${this.model}`;
@@ -9035,7 +9047,7 @@
         fullModelPath = `projects/${this._apiSettings.project}/locations/${this._apiSettings.location}/${this.model}`;
       }
       const { inputAudioTranscription, outputAudioTranscription, ...generationConfig } = this.generationConfig;
-      const setupMessage = {
+      return {
         setup: {
           model: fullModelPath,
           generationConfig,
@@ -9046,9 +9058,22 @@
           outputAudioTranscription
         }
       };
+    }
+    /**
+     * Starts a {@link LiveSession}.
+     *
+     * @returns A {@link LiveSession}.
+     * @throws If the connection failed to be established with the server.
+     *
+     * @beta
+     */
+    async connect(setupMessage) {
+      const url = new WebSocketUrl(this._apiSettings);
+      await this._webSocketHandler.connect(url.toString());
+      const message = setupMessage ?? this.createSetupMessage();
       try {
         const serverMessages = this._webSocketHandler.listen();
-        this._webSocketHandler.send(JSON.stringify(setupMessage));
+        this._webSocketHandler.send(JSON.stringify(message));
         const firstMessage = (await serverMessages.next()).value;
         if (!firstMessage || !(typeof firstMessage === "object") || !("setupComplete" in firstMessage)) {
           await this._webSocketHandler.close(1011, "Handshake failure");
@@ -9136,25 +9161,28 @@
           resolvePromise();
           resolvePromise = null;
         }
-        this.ws?.removeEventListener("message", messageListener);
-        this.ws?.removeEventListener("close", closeListener);
-        this.ws?.removeEventListener("error", errorListener);
       };
       this.ws.addEventListener("message", messageListener);
       this.ws.addEventListener("close", closeListener);
       this.ws.addEventListener("error", errorListener);
-      while (!isClosed) {
-        if (errorQueue.length > 0) {
-          const error = errorQueue.shift();
-          throw error;
+      try {
+        while (!isClosed) {
+          if (errorQueue.length > 0) {
+            const error = errorQueue.shift();
+            throw error;
+          }
+          if (messageQueue.length > 0) {
+            yield messageQueue.shift();
+          } else {
+            await new Promise((resolve) => {
+              resolvePromise = resolve;
+            });
+          }
         }
-        if (messageQueue.length > 0) {
-          yield messageQueue.shift();
-        } else {
-          await new Promise((resolve) => {
-            resolvePromise = resolve;
-          });
-        }
+      } finally {
+        this.ws?.removeEventListener("message", messageListener);
+        this.ws?.removeEventListener("close", closeListener);
+        this.ws?.removeEventListener("error", errorListener);
       }
       if (errorQueue.length > 0) {
         const error = errorQueue.shift();
@@ -9281,8 +9309,11 @@
     /**
      * Adds audio data to the queue and ensures the playback loop is running.
      */
-    enqueueAndPlay(audioData) {
-      this.playbackQueue.push(audioData);
+    enqueueAndPlay(audioData, turnComplete) {
+      this.playbackQueue.push({
+        buffer: audioData,
+        turnComplete
+      });
       void this.processPlaybackQueue();
     }
     /**
@@ -9304,25 +9335,38 @@
       }
       this.isPlaybackLoopRunning = true;
       while (this.playbackQueue.length > 0 && !this.isStopped) {
-        const pcmRawBuffer = this.playbackQueue.shift();
+        const { buffer: pcmRawBuffer, turnComplete } = this.playbackQueue.shift();
         try {
           const pcm16 = new Int16Array(pcmRawBuffer);
           const frameCount = pcm16.length;
-          const audioBuffer = this.deps.audioContext.createBuffer(1, frameCount, SERVER_OUTPUT_SAMPLE_RATE);
-          const channelData = audioBuffer.getChannelData(0);
-          for (let i = 0; i < frameCount; i++) {
-            channelData[i] = pcm16[i] / 32768;
+          if (frameCount > 0) {
+            const audioBuffer = this.deps.audioContext.createBuffer(1, frameCount, SERVER_OUTPUT_SAMPLE_RATE);
+            const channelData = audioBuffer.getChannelData(0);
+            for (let i = 0; i < frameCount; i++) {
+              channelData[i] = pcm16[i] / 32768;
+            }
+            const source = this.deps.audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(this.deps.audioContext.destination);
+            this.scheduledSources.push(source);
+            source.onended = () => {
+              this.scheduledSources = this.scheduledSources.filter((s) => s !== source);
+            };
+            this.nextStartTime = Math.max(this.deps.audioContext.currentTime, this.nextStartTime);
+            source.start(this.nextStartTime);
+            this.nextStartTime += audioBuffer.duration;
           }
-          const source = this.deps.audioContext.createBufferSource();
-          source.buffer = audioBuffer;
-          source.connect(this.deps.audioContext.destination);
-          this.scheduledSources.push(source);
-          source.onended = () => {
-            this.scheduledSources = this.scheduledSources.filter((s) => s !== source);
-          };
-          this.nextStartTime = Math.max(this.deps.audioContext.currentTime, this.nextStartTime);
-          source.start(this.nextStartTime);
-          this.nextStartTime += audioBuffer.duration;
+          if (turnComplete) {
+            const msUntilFinish = (this.nextStartTime - this.deps.audioContext.currentTime) * 1e3;
+            setTimeout(() => {
+              if (!this.isStopped) {
+                this.liveSession.dispatchSignal({
+                  type: "signal",
+                  signal: "audio_playback_complete"
+                });
+              }
+            }, msUntilFinish);
+          }
         } catch (e) {
           logger2.error("Error playing audio:", e);
         }
@@ -9349,9 +9393,12 @@
             this.interruptPlayback();
           }
           const audioPart = serverContent.modelTurn?.parts.find((part) => part.inlineData?.mimeType.startsWith("audio/"));
+          let audioData = new ArrayBuffer(0);
           if (audioPart?.inlineData) {
-            const audioData = Uint8Array.from(atob(audioPart.inlineData.data), (c) => c.charCodeAt(0)).buffer;
-            this.enqueueAndPlay(audioData);
+            audioData = Uint8Array.from(atob(audioPart.inlineData.data), (c) => c.charCodeAt(0)).buffer;
+          }
+          if (audioData.byteLength > 0 || serverContent.turnComplete) {
+            this.enqueueAndPlay(audioData, !!serverContent.turnComplete);
           }
         } else if (message.type === "toolCall") {
           if (!this.options.functionCallingHandler) {
@@ -9463,7 +9510,8 @@
 
   // audioShared.ts
   var AUDIO_GENERATION_CONFIG = {
-    model: "gemini-2.5-flash-native-audio-preview-09-2025",
+    model: "gemini-live-2.5-flash-preview-native-audio-09-2025",
+    // model: "gemini-2.5-flash-native-audio-preview-09-2025",
     // model: "gemini-live-2.5-flash-preview",
     generationConfig: {
       inputAudioTranscription: {},
@@ -9472,7 +9520,7 @@
       speechConfig: {
         voiceConfig: {
           prebuiltVoiceConfig: {
-            voiceName: "Aoede"
+            voiceName: "Leda"
           }
         }
       }
@@ -9504,11 +9552,18 @@
       for await (const message of messageStream) {
         console.log(message);
         if (message.type === "serverContent") {
+          if (message.inputTranscription && message.inputTranscription.finished) {
+            flushUser();
+          }
+          if (message.outputTranscription && (message.outputTranscription.finished || message.outputTranscription.generationComplete)) {
+            flushModel();
+          }
           if (message.inputTranscription?.text) {
             flushModel();
             const text = message.inputTranscription.text;
-            callbacks.onUserPart(text);
-            userTranscription.push(text);
+            const textToEmit = userTranscription.length > 0 && !text.startsWith(" ") ? " " + text : text;
+            callbacks.onUserPart(textToEmit);
+            userTranscription.push(textToEmit);
             if (userFlushTimeout) clearTimeout(userFlushTimeout);
             userFlushTimeout = setTimeout(flushUser, 2e3);
           }
@@ -9531,6 +9586,8 @@
             flushUser();
             flushModel();
           }
+        } else if (message.type === "unknown" && callbacks.onUnknownMessage) {
+          callbacks.onUnknownMessage(message);
         }
       }
     } finally {
@@ -9544,15 +9601,33 @@
       ...AUDIO_GENERATION_CONFIG,
       systemInstruction
     });
-    const session = await model.connect();
+    const setupMessage = model.createSetupMessage();
+    const connectParams = {
+      setup: {
+        ...setupMessage.setup,
+        generationConfig: {
+          ...setupMessage.setup.generationConfig,
+          thinkingConfig: {
+            // thinkingBudget: 1024
+          },
+          enableAffectiveDialog: true
+        },
+        contextWindowCompression: {
+          triggerTokens: 128e3,
+          slidingWindow: { targetTokens: 1e5 }
+        }
+      }
+    };
+    console.log("session created", { setupMessage, connectParams });
+    const session = await model.connect(connectParams);
     await startAudioConversation(session);
     return session;
   }
-  async function setupAudioSession(ai2, callbacks, systemInstruction, initialMessage = "(call started)") {
+  async function setupAudioSession(ai2, callbacks, systemInstruction, initialMessage = "(Call started)") {
     const session = await connectAndStartAudioSession(ai2, systemInstruction);
     if (initialMessage) {
       console.log(`intial message sent ${initialMessage}`);
-      session.send(initialMessage);
+      session.send({ clientContent: { turns: [{ role: "user", parts: [{ text: initialMessage }] }], turnComplete: true } });
     }
     processStreamMessages(session, callbacks).catch((err) => {
       console.error("Error in processStreamMessages:", err);
@@ -9570,7 +9645,7 @@
   console.log("app init");
   try {
     auth = getAuth(app);
-    ai = getAI(app);
+    ai = getAI(app, { backend: new VertexAIBackend("us-central1") });
     log("Audio WebView initialized");
   } catch (err) {
     log("Audio WebView init failed: " + JSON.stringify(err.stack));
@@ -9618,7 +9693,8 @@
         onModelPart: (text) => post({ type: "gemini-part", message: text }),
         onUserFlush: (text) => post({ type: "user", message: text }),
         onModelFlush: (text) => post({ type: "gemini", message: text }),
-        onEnded: () => post({ type: "ended", message: "" })
+        onEnded: () => post({ type: "ended", message: "" }),
+        onUnknownMessage: (msg) => post({ type: "serverMessage", message: msg })
       }, systemInstruction);
     } catch (error) {
       log(`Failed to start audio session: ${error?.message || error}

@@ -206,6 +206,7 @@ export interface Qualia {
   currentQualiaDocId?: string;
   processingBefore?: Timestamp;
   lockOwner?: string;
+  createdTime: Timestamp;
 }
 
 // Uses a unified 'onAction' prop to handle switching and creation

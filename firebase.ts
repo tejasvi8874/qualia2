@@ -49,7 +49,7 @@ export async function qualiaDocOperationsCollection() {
   return collection(db, "qualiaDocOperations");
 }
 
-export function getMessageListener(userId: string, collectionRef: CollectionReference<DocumentData, DocumentData>, echoFilter: QueryCompositeFilterConstraint | QueryFieldFilterConstraint, callback: (communication: Communication) => Promise<void>, singleListener: boolean, processedField: string = "ack") {
+export function getMessageListener(userId: string, collectionRef: CollectionReference<DocumentData, DocumentData>, echoFilter: QueryCompositeFilterConstraint | QueryFieldFilterConstraint, callback: (communication: Communication) => Promise<void>, singleListener: boolean, processedField: string = "ack", shouldMarkProcessed?: (communication: Communication) => boolean) {
   console.log(`Registering message listener for userId: ${userId} and communicationTypeFilter: ${JSON.stringify(echoFilter)}`);
   // Filters excludes docs where the field is not set.
   const q = query(
@@ -75,9 +75,13 @@ export function getMessageListener(userId: string, collectionRef: CollectionRefe
           console.log(`Handling message in generic listener: ${JSON.stringify(data)}`);
           new Promise(resolve => setTimeout(resolve, timeToWait)).then(() => {
             if (singleListener) {
-              processData(data, doc.ref, callback, processedField);
+              processData(data, doc.ref, callback, processedField, shouldMarkProcessed);
             } else {
-              callback(data).then(() => updateDoc(doc.ref, { [processedField]: true }));
+              callback(data).then(() => {
+                if (!shouldMarkProcessed || shouldMarkProcessed(data)) {
+                  updateDoc(doc.ref, { [processedField]: true });
+                }
+              });
             }
           });
         }
@@ -91,7 +95,7 @@ const NETWORK_DELAY_SECONDS = 2
 const PROCESSING_SECONDS = 60
 
 
-async function processData(data: Communication, ref: DocumentReference<DocumentData, DocumentData>, callback: (communication: Communication) => Promise<void>, processedField: string): Promise<void> {
+async function processData(data: Communication, ref: DocumentReference<DocumentData, DocumentData>, callback: (communication: Communication) => Promise<void>, processedField: string, shouldMarkProcessed?: (communication: Communication) => boolean): Promise<void> {
   if (data.processingBefore) {
     const processingBefore = data.processingBefore.toMillis();
     const timeToWait = getTimeToWait(processingBefore);
@@ -100,19 +104,23 @@ async function processData(data: Communication, ref: DocumentReference<DocumentD
       await waitForLockRelease(ref, timeToWait);
       const doc = await getDoc(ref);
       if (doc.exists() && !doc.data()![processedField]) {
-        return await processData(data, ref, callback, processedField);
+        return await processData(data, ref, callback, processedField, shouldMarkProcessed);
       }
     };
   }
-  return await claimAndProcess(ref, callback, data, processedField);
+  return await claimAndProcess(ref, callback, data, processedField, shouldMarkProcessed);
 }
 
-async function claimAndProcess(ref: DocumentReference<DocumentData, DocumentData>, callback: (communication: Communication) => Promise<void>, data: Communication, processedField: string): Promise<void> {
+async function claimAndProcess(ref: DocumentReference<DocumentData, DocumentData>, callback: (communication: Communication) => Promise<void>, data: Communication, processedField: string, shouldMarkProcessed?: (communication: Communication) => boolean): Promise<void> {
   try {
     const result = await runWithLock(
       ref,
       async (_lockOwnerId) => {
-        return await callback(data).then(() => updateDoc(ref, { [processedField]: true }));
+        return await callback(data).then(() => {
+          if (!shouldMarkProcessed || shouldMarkProcessed(data)) {
+            updateDoc(ref, { [processedField]: true });
+          }
+        });
       },
       PROCESSING_SECONDS,
       (docData) => !docData[processedField]

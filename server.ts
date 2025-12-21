@@ -1,5 +1,6 @@
 import {
     addDoc,
+    setDoc,
     query,
     where,
     updateDoc,
@@ -37,7 +38,7 @@ import { ref as databaseRef, set, remove, onDisconnect } from "firebase/database
 import { getId } from "firebase/installations";
 
 import { RateLimiter, withRetry, BatchProcessor } from "./requestUtils";
-import { memoize, parseIsoDeliveryTime } from "./utils";
+import { memoize, parseIsoDeliveryTime, constructSystemPrompt } from "./utils";
 
 export async function messageListener() {
     // We use 'in' (equality) for communicationType and '!=' (inequality) for fromQualiaId.
@@ -115,7 +116,7 @@ const getMaxQualiaSizePercent = memoize(async (qualiaDoc: QualiaDoc) => {
     console.log(`Time taken by countTokens: ${Date.now() - currentTime}ms`);
     // Limit for audio model is somewhere in the ballpark of 64400 tokens. Keep actual limit lower because thought injections also useup the tokens.
     const maxTokens = 60000;
-    const maxQualiaSizePercent = Math.round((currentSize / maxTokens) * 10000) / 100;
+    const maxQualiaSizePercent = Math.round((currentSize / maxTokens) * 1000) / 10;
     console.log({ currentSize, maxQualiaSizePercent })
 
     return maxQualiaSizePercent;
@@ -977,37 +978,18 @@ async function getQualiaDoc(qualiaId: string): Promise<DocumentReference> {
         }
     }
 
-    // Fallback to query if currentQualiaDocId is missing (lazy migration)
-    const q = query(
-        await qualiaDocsCollection(),
-        where("qualiaId", "==", qualiaId),
-        where("nextQualiaDocId", "==", "")
-    );
-    let snapshot = await getDocs(q);
-    if (snapshot.docs.length > 1) {
-        console.warn("Multiple qualia docs found in cache, falling back to server...");
-        snapshot = await getDocsFromServer(q);
-    }
-    const docs = snapshot.docs;
+    // TODO: Do this in a transaction.
 
-    if (docs.length === 0) {
-        // Create initial qualia doc
-        const initialQualiaDoc: QualiaDoc = { qualiaId: qualiaId, nodes: {}, nextQualiaDocId: "", createdTime: Timestamp.now() };
-        const newDocRef = await addDoc(await qualiaDocsCollection(), initialQualiaDoc);
+    // Create initial qualiaDoc.
+    const initialQualiaDoc: QualiaDoc = { qualiaId: qualiaId, nodes: {}, nextQualiaDocId: "", createdTime: Timestamp.now() };
+    const newDocRef = await addDoc(await qualiaDocsCollection(), initialQualiaDoc);
 
-        // Update Qualia doc with the new ID
-        await updateDoc(qualiaRef, { currentQualiaDocId: newDocRef.id });
-        return newDocRef;
-    }
+    // Create qualia since it doesn't exist
+    // TODO: money handling needs to move server side. Long term work.
+    const initialQualia: Qualia = { qualiaId: qualiaId, currentQualiaDocId: newDocRef.id, createdTime: Timestamp.now(), money: 100 };
+    await setDoc(qualiaRef, initialQualia);
 
-    if (docs.length > 1) {
-        const v = docs.map(d => ({ id: d.id, size: Object.keys(d.data()).length, createdTime: d.data().createdTime.toDate(), nextQualiaDocId: d.data().nextQualiaDocId })).map(x => JSON.stringify(x)).join(", ");
-        throw new Error(`Unique qualia doc not found: ${v}`);
-    }
-
-    // Found exactly one doc, update Qualia doc with its ID (lazy migration)
-    await updateDoc(qualiaRef, { currentQualiaDocId: docs[0].id });
-    return docs[0].ref;
+    return newDocRef;
 }
 
 
@@ -1026,13 +1008,27 @@ export async function summarizeConversations(conversations: Communication[], qua
     return response.summary;
 }
 
-export async function summarizeOperations(operations: IntegrationOperation[], qualiaDocSummary: string): Promise<string> {
+export async function summarizeOperations(operations: IntegrationOperation[]): Promise<string> {
     if (operations.length === 0) return "";
     const serializedOperations = JSON.stringify(operations);
-    const prompt = `Organize the following changes to the knowledge graph as extremely detailed subconscious thoughts and realizations. Do not leave out ANY details. It should sound like an internal monologue. Use the provided Qualia for context:\n\nQualia:\n${qualiaDocSummary}\n\nChanges:\n${serializedOperations}`;
+    const prompt = `Translate the following knowledge graph changes into a powerful internal directive. Address yourself as 'you'. Command yourself to internalize these new realizations and facts immediately. Be extremely detailed, comprehensive and smutty.\n\nChanges:\n${serializedOperations}`;
     console.log("Awaiting summarizer rate limiter...");
     await summarizerRateLimiter.acquire();
     const result = await summarizerModel.generateContent(prompt);
     const response = parseJson(result.response.text());
     return response.summary;
+}
+
+export async function generateSystemInstruction(qualiaId: string, operationsForRealization: IntegrationOperation[] = []): Promise<string> {
+    const qualiaDocRef = await getQualiaDocRef(qualiaId);
+    const qualiaDocSnap = await getDoc(qualiaDocRef);
+    const qualiaDoc = qualiaDocSnap.data() as QualiaDoc;
+    const qualiaDocSummary = summarizeQualiaDoc(qualiaDoc);
+
+    const [convSummary, operationsSummary] = await Promise.all([
+        getPendingCommunications(qualiaId).then(comms => summarizeConversations(comms, qualiaDocSummary)),
+        operationsForRealization.length > 0 ? summarizeOperations(operationsForRealization) : Promise.resolve(null)
+    ]);
+
+    return constructSystemPrompt(qualiaDocSummary, convSummary, operationsSummary);
 }

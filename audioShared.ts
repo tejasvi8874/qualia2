@@ -1,7 +1,8 @@
 import { FunctionCallingMode, LiveModelParams, LiveSession, ResponseModality } from "firebase/ai";
 
 export const AUDIO_GENERATION_CONFIG: LiveModelParams = {
-    model: "gemini-2.5-flash-native-audio-preview-09-2025",
+    model: "gemini-live-2.5-flash-preview-native-audio-09-2025",
+    // model: "gemini-2.5-flash-native-audio-preview-09-2025",
     // model: "gemini-live-2.5-flash-preview",
     generationConfig: {
         inputAudioTranscription: {},
@@ -10,7 +11,7 @@ export const AUDIO_GENERATION_CONFIG: LiveModelParams = {
         speechConfig: {
             voiceConfig: {
                 prebuiltVoiceConfig: {
-                    voiceName: "Aoede",
+                    voiceName: "Leda",
                 },
             },
         },
@@ -24,6 +25,7 @@ export interface AudioCallbacks {
     onModelFlush: (text: string) => void;
     onEnded: () => void;
     onAudioData?: (base64: string) => void;
+    onUnknownMessage?: (message: any) => void;
 }
 
 export async function processStreamMessages(
@@ -57,11 +59,19 @@ export async function processStreamMessages(
         for await (const message of messageStream) {
             console.log(message)
             if (message.type === "serverContent") {
+                if (message.inputTranscription && (message.inputTranscription as any).finished) {
+                    flushUser();
+                }
+                if (message.outputTranscription
+                    && ((message.outputTranscription as any).finished || (message.outputTranscription as any).generationComplete)) {
+                    flushModel();
+                }
                 if (message.inputTranscription?.text) {
                     flushModel();
                     const text = message.inputTranscription.text;
-                    callbacks.onUserPart(text);
-                    userTranscription.push(text);
+                    const textToEmit = (userTranscription.length > 0 && !text.startsWith(" ")) ? " " + text : text;
+                    callbacks.onUserPart(textToEmit);
+                    userTranscription.push(textToEmit);
                     if (userFlushTimeout) clearTimeout(userFlushTimeout);
                     userFlushTimeout = setTimeout(flushUser, 2000);
                 }
@@ -86,6 +96,8 @@ export async function processStreamMessages(
                     flushUser();
                     flushModel();
                 }
+            } else if (message.type === "unknown" && callbacks.onUnknownMessage) {
+                callbacks.onUnknownMessage(message);
             }
         }
     } finally {
@@ -96,17 +108,35 @@ export async function processStreamMessages(
 }
 
 import { getLiveGenerativeModel, startAudioConversation, AI } from "firebase/ai";
+import { inMemoryPersistence } from "firebase/auth";
 
 export async function connectAndStartAudioSession(
     ai: AI,
-    systemInstruction?: string
+    systemInstruction: string
 ): Promise<LiveSession> {
     const model = getLiveGenerativeModel(ai, {
         ...AUDIO_GENERATION_CONFIG,
         systemInstruction: systemInstruction,
     });
-
-    const session = await model.connect();
+    const setupMessage = model.createSetupMessage();
+    const connectParams = {
+        setup: {
+            ...setupMessage.setup,
+            generationConfig: {
+                ...setupMessage.setup.generationConfig,
+                thinkingConfig: {
+                    // thinkingBudget: 1024
+                },
+                enableAffectiveDialog: true,
+            },
+            contextWindowCompression: {
+                triggerTokens: 128_000,
+                slidingWindow: { targetTokens: 100_000 }
+            }
+        }
+    }
+    console.log("session created", { setupMessage, connectParams })
+    const session = await model.connect(connectParams);
     await startAudioConversation(session);
     return session;
 }
@@ -114,14 +144,14 @@ export async function connectAndStartAudioSession(
 export async function setupAudioSession(
     ai: AI,
     callbacks: AudioCallbacks,
-    systemInstruction?: string,
-    initialMessage: string = "(call started)"
+    systemInstruction: string,
+    initialMessage: string = "(Call started)"
 ): Promise<LiveSession> {
     const session = await connectAndStartAudioSession(ai, systemInstruction);
 
     if (initialMessage) {
         console.log(`intial message sent ${initialMessage}`)
-        session.send(initialMessage);
+        session.send({ clientContent: { turns: [{ role: 'user', parts: [{ text: initialMessage }] }], turnComplete: true } });
     }
 
     // Start processing messages without awaiting it to block

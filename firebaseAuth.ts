@@ -1,4 +1,5 @@
 import { getAuth, browserLocalPersistence, User, onAuthStateChanged, initializeAuth } from "firebase/auth";
+//@ts-ignore getReactNativePersistence is not exported https://github.com/firebase/firebase-js-sdk/issues/7584#issuecomment-1785705367
 import { getReactNativePersistence } from "firebase/auth"
 import {
     getFirestore,
@@ -6,7 +7,7 @@ import {
     persistentMultipleTabManager,
     initializeFirestore,
 } from "firebase/firestore";
-import { getAI, GoogleAIBackend } from "firebase/ai";
+import { getAI, GoogleAIBackend, VertexAIBackend } from "firebase/ai";
 import { getDatabase } from "firebase/database";
 import { getInstallations } from "firebase/installations";
 
@@ -15,7 +16,7 @@ import { firebaseConfig } from "./firebaseConfig";
 import Constants from "expo-constants";
 import { Platform } from "react-native";
 
-const app = initializeApp(firebaseConfig);
+export const app = initializeApp(firebaseConfig);
 initializeFirestore(app, {
     localCache: Platform.OS === "web"
         ? persistentLocalCache({ tabManager: persistentMultipleTabManager() })
@@ -51,6 +52,6 @@ export async function waitForUser(timeoutMs: number = 15000): Promise<User> {
 }
 
 export const db = getFirestore(app);
-export const ai = getAI(app, { backend: new GoogleAIBackend() });
+export const ai = getAI(app, { backend: new VertexAIBackend('global') });
 export const rtdb = getDatabase(app);
 export const installations = getInstallations(app);
