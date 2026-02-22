@@ -77,7 +77,12 @@ async function createQualia(qualiaId: string): Promise<Qualia> {
       return qualiaDoc.data() as Qualia;
     }
     // TODO: Instead of setting money here, create server side listener to for qualia creation that sets initial money.
-    const newQualia: Qualia = { qualiaId, money: 100 };
+    const newQualia: Qualia = {
+      qualiaId,
+      money: 100,
+      currentQualiaNodeDocIds: [],
+      createdTime: Timestamp.now()
+    };
     transaction.set(qualiaDocRef, newQualia);
     return newQualia;
   });

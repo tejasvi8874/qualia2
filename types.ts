@@ -133,26 +133,52 @@ export interface FunctionCall {
   createTime?: Timestamp;
 }
 
+export interface GenerateEmbeddingsRequest {
+  contents: string[];
+  taskType: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT";
+}
+
+export interface GenerateEmbeddingsResponse {
+  embeddings: { values: number[] }[];
+}
+
 export interface Communications {
   reasoning?: string;
   communications: Communication[];
 }
 
-export interface QualiaNode {
-  id: string;
-  conclusion: string;
+export interface QualiaNodeDoc {
+  id: string; // Node/Conclusion ID
+  qualiaId: string;
+  content: string; // Conclusion text
   assumptionIds: string[];
-  timestamp: Timestamp;
+  parentConclusionIds?: string[]; // Optional: for back-traversal if needed, or we rely on assumptionIds of others? GraphView expansion needs this.
+  // Actually, keeping parent pointers is expensive to maintain if parents change often. 
+  // But purely for traversal, we might need an index or just use collection group queries?
+  // "nodes will continue to store... parent conclusion nodes for faster graph traversal" -> YES.
+
+  nextDocId: string; // Empty string if latest
+  previousDocId: string; // Empty string if first
+
+  deleted: boolean;
+
+  createdTime: Timestamp;
 }
 
-export interface QualiaDoc {
+export interface QualiaNodeEmbedding {
   qualiaId: string;
-  nodes: Record<string, QualiaNode>;
-  nextQualiaDocId: string;
-  processingBefore?: Timestamp;
+  nodeId: string;
+  nodeDocId: string;
+  vector: any; // FieldValue.vector or number[] depending on read/write context. In types, usually just any or number[]? Firestore types might have VectorValue.
+  taskType: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT";
+  deleted: boolean;
   createdTime: Timestamp;
-  lockOwner?: string;
 }
+
+export interface EmbedContentConfig {
+  taskType?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT";
+}
+
 
 export const INTEGRATION_SCHEMA = Schema.object({
   properties: {
@@ -190,8 +216,7 @@ export interface IntegrationResponse {
 
 export interface QualiaDocOperationRecord {
   qualiaId: string;
-  oldQualiaDocId: string;
-  newQualiaDocId?: string;
+  changedNodeDocIds: { oldId: string, newId: string }[]; 
   operations: IntegrationOperation[];
   communicationIds: string[];
   createdTime: Timestamp;
@@ -199,13 +224,21 @@ export interface QualiaDocOperationRecord {
   reasoning?: string;
 }
 
+export interface LockState {
+  processingBefore: Timestamp | null;
+  lockOwner: string | null;
+}
+
 export interface Qualia {
   qualiaId: string;
   money: number;
   phoneNumber?: string;
-  currentQualiaDocId?: string;
-  processingBefore?: Timestamp;
-  lockOwner?: string;
+
+  currentQualiaNodeDocIds: string[]; // List of IDs of the latest version of every active node
+
+  integrationLock?: LockState;
+  responseLock?: LockState;
+
   createdTime: Timestamp;
 }
 
@@ -214,4 +247,14 @@ export interface ContextQualia {
   id: string;
   name: string;
   lastContactTime: Timestamp;
+}
+
+export interface GraphNode {
+  id: string;
+  conclusion: string;
+  assumptions: string[];
+}
+
+export interface SerializedQualia {
+  qualia: GraphNode[];
 }

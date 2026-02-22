@@ -80,9 +80,9 @@ export interface SerializedQualia {
     recentCommunications: Record<string, any>[];
 }
 
-export function serializeQualia(doc: QualiaDoc, pendingCommunications: Communication[] = []): SerializedQualia {
+export function serializeQualia(doc: QualiaDoc): SerializedQualia {
     const nodes = doc.nodes || {};
-    const pending = pendingCommunications.map(serializeCommunication);
+
 
     // Build adjacency list (Parent -> Children) and in-degree (Child -> Parents count)
     // Actually, for "roots" we want nodes that are not assumptions of anyone.
@@ -168,7 +168,7 @@ export function serializeQualia(doc: QualiaDoc, pendingCommunications: Communica
         }
     }
 
-    return { "qualia": serializedNodes, "recentCommunications": pending };
+    return { "qualia": serializedNodes, "recentCommunications": [] };
 }
 
 export class BaseGraphCorruptionError extends Error {

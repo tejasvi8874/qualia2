@@ -28,9 +28,9 @@ import { File } from 'expo-file-system';
 import { getLocales } from 'expo-localization';
 import { getCountryCallingCode } from './countryCodes';
 import { registerClientMessageClb, sendMessage, getContacts, getHistoricalMessages, callCloudFunction } from './firebaseClientUtils';
-import { Communication, ContextQualia, QualiaDoc, QualiaDocOperationRecord } from "./types";
+import { Communication, ContextQualia, QualiaDocOperationRecord } from "./types";
 import { Timestamp, getDoc, addDoc, writeBatch, doc, query, where, onSnapshot, runTransaction } from "firebase/firestore";
-import { messageListener, startIntegrationLoop, getPendingCommunications, getQualiaDocRef, updateContacts, summarizeQualiaDoc, summarizeConversations, summarizeOperations, summarizerModel, generateSystemInstruction } from "./server";
+import { messageListener, startIntegrationLoop, getPendingCommunications, updateContacts, summarizeConversations, summarizeOperations, summarizerModel, generateSystemInstruction } from "./server";
 import { serializeQualia } from "./graphUtils";
 import { auth, db } from "./firebaseAuth";
 import { communicationsCollection, qualiaDocOperationsCollection } from "./firebase";
@@ -1341,7 +1341,6 @@ const AppContent = () => {
         const q = query(
           collection,
           where("qualiaId", "==", activeQualia.id),
-          where("newQualiaDocId", ">", ""),
           where("createdTime", ">", callStartTime)
         );
 
@@ -1350,8 +1349,7 @@ const AppContent = () => {
           for (const change of snapshot.docChanges()) {
             if (change.type === "added") {
               const data = change.doc.data() as QualiaDocOperationRecord;
-              // Only process if it has a newQualiaDocId (successful operation)
-              if (data.newQualiaDocId) {
+              if (data.changedNodeDocIds && data.changedNodeDocIds.length > 0) {
                 console.log("Queueing subconscious thoughts from operation:", change.doc.id);
                 batchProcessor.add(data);
               }
